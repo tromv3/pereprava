@@ -18,7 +18,7 @@ rm -f /usr/local/bin/xray /usr/local/bin/exitctl /etc/cron.d/xray-geodata \
 
 if command -v ufw >/dev/null; then
   for _ in $(seq 20); do
-    n=$(ufw status numbered | sed -nE 's/^\[ *([0-9]+)\] 443\/tcp .*/\1/p' | head -1)
+    n=$(ufw status numbered | sed -nE 's/^\[ *([0-9]+)\] 443\/tcp .*/\1/p' | awk 'NR==1')
     [ -n "$n" ] || break
     ufw --force delete "$n" >/dev/null
   done

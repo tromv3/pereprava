@@ -1,8 +1,8 @@
 import './style.css';
 import {
-  AddExit, AddUser, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Install, ListExits,
+  AddDirect, AddExit, AddUser, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Install, ListExits,
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
-  UpdateGeodata, UseExit,
+  ListDirect, RemoveDirect, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn } from '../wailsjs/runtime/runtime';
 
@@ -255,7 +255,7 @@ function egressWarning(st) {
 function renderServerBody(body, server, st) {
   const panels = !st.installed ? [installPanel(server, st)]
     : st.mode === 'exit' ? [exitInfoPanel(server)]
-      : st.mode === 'bridge' ? [exitsPanel(server), usersPanel(server, st)]
+      : st.mode === 'bridge' ? [exitsPanel(server), usersPanel(server, st), directPanel(server)]
         : [usersPanel(server, st)];
   if (st.installed) panels.push(maintenancePanel(server, st));
   body.replaceChildren(...[egressWarning(st), statusPanel(st), ...panels].filter(Boolean));
@@ -295,14 +295,77 @@ function maintenancePanel(server, st) {
     if (!ok) return;
     run(uninstallBtn, () => Uninstall(server.id), () => openServer(server.id));
   });
-  buttons.push(uninstallBtn);
+  const xrayBtn = h('button', {}, 'Обновить Xray');
+  xrayBtn.addEventListener('click', async () => {
+    const ok = await confirmDialog('Обновить Xray?',
+      `Последняя версия Xray скачается на этом компьютере и заменит ${(st.xray.version || '').split(' ').slice(0, 2).join(' ') || 'текущую версию'}. Xray перезапустится, у подключённых будет короткий обрыв. Если новая версия не примет настройки или не запустится, вернётся старая.`,
+      'Обновить');
+    // Журнал не стираем: в нём итог — обновился Xray или уже был последней версии.
+    if (ok) run(xrayBtn, () => UpdateXray(server.id), () => { log.textContent += 'Готово. Новую версию покажет кнопка «Обновить» вверху.\n'; });
+  });
+  // exitctl ставится на мост и простой сервер; приложение пользуется своей копией,
+  // а установленная нужна тем, кто работает в консоли сервера.
+  const toolOutdated = st.mode !== 'exit' && st.tool_sha256 && st.bundled_tool_sha256
+    && st.tool_sha256 !== st.bundled_tool_sha256;
+  const toolBtn = h('button', {}, 'Обновить exitctl на сервере');
+  toolBtn.addEventListener('click', () => run(toolBtn, () => UpdateTool(server.id), () => openServer(server.id)));
+
   // Списки сайтов нужны мосту и простому режиму: выход маршрутизацию по ним не делает.
-  if (st.mode !== 'exit') buttons.unshift(geoBtn);
+  if (st.mode !== 'exit') buttons.push(geoBtn);
+  buttons.push(xrayBtn);
+  if (toolOutdated) buttons.push(toolBtn);
+  buttons.push(uninstallBtn);
 
   return h('div', { class: 'panel' }, h('h3', {}, 'Обслуживание'), errorBox,
     st.mode !== 'exit' && h('p', { class: 'hint', style: 'margin-bottom:8px' },
       'Списки российских сайтов и адресов обычно обновляются на сервере раз в неделю. Если серверу недоступен GitHub, обновляйте их отсюда.'),
+    toolOutdated && h('p', { class: 'hint', style: 'margin-bottom:8px' },
+      'На сервере старая версия exitctl. Приложению она не мешает, но в консоли сервера будут старые команды.'),
     h('div', { class: 'row' }, buttons), log);
+}
+
+function directPanel(server) {
+  const list = h('div', {}, h('p', { class: 'hint' }, 'Загружаю список...'));
+  const errorBox = h('div');
+  const input = h('input', { placeholder: 'например gosuslugi.ru' });
+  const addBtn = h('button', { class: 'primary' }, 'Добавить');
+  const showError = (e) => errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+
+  async function load() {
+    const domains = (await ListDirect(server.id)) || [];
+    list.replaceChildren(domains.length
+      ? h('table', {}, h('tbody', {}, domains.map((d) => h('tr', {}, h('td', {}, d),
+        h('td', { class: 'actions' }, h('button', { class: 'danger', onclick: () => remove(d) }, 'Убрать'))))))
+      : h('p', { class: 'hint' }, 'Своих доменов нет: напрямую идут только сайты из встроенных списков российских сайтов.'));
+  }
+
+  async function act(fn) {
+    errorBox.replaceChildren();
+    addBtn.disabled = true;
+    try {
+      await fn();
+      await load();
+    } catch (e) {
+      showError(e);
+    } finally {
+      addBtn.disabled = false;
+    }
+  }
+
+  function remove(d) {
+    act(() => RemoveDirect(server.id, d));
+  }
+
+  addBtn.addEventListener('click', () => act(async () => {
+    await AddDirect(server.id, input.value);
+    input.value = '';
+  }));
+
+  load().catch((e) => { list.replaceChildren(); showError(e); });
+  return h('div', { class: 'panel' }, h('h3', {}, 'Сайты напрямую'), errorBox,
+    h('p', { class: 'hint', style: 'margin-bottom:8px' },
+      'Эти домены мост открывает сам, не через выход: например, российский сайт, которого нет во встроенных списках, или сайт, который не пускает зарубежные адреса. Поддомены входят автоматически. Изменение списка коротко перезапускает Xray.'),
+    h('div', { class: 'row', style: 'margin-bottom:10px' }, input, addBtn), list);
 }
 
 function exitInfoPanel(server) {

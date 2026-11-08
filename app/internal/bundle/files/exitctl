@@ -9,7 +9,7 @@
   exitctl check [--json]           проверить доступность выходов (TCP)
   exitctl direct add <домен>       пускать домен напрямую с моста
   exitctl direct remove <домен>    убрать домен из списка «напрямую»
-  exitctl direct list              список своих доменов «напрямую»
+  exitctl direct list [--json]     список своих доменов «напрямую»
   exitctl sni check <домен> [--ip IP] [--tries N] [--json]
                                    проверить домен для SNI (код выхода 1 — не подходит)
   exitctl sni scan [--ip IP] [--role bridge|exit] [--top N] [--workers N] [--max-checks N] [--json]
@@ -22,6 +22,7 @@
   exitctl reach <адрес> <порт> [--json]            достаёт ли этот сервер до адреса (код 1 — нет)
 """
 import contextlib, ipaddress, json, os, re, shutil, socket, ssl, statistics, subprocess, sys, tempfile, time, uuid
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import urlopen
@@ -53,6 +54,7 @@ RE_INFRA = re.compile(r"cdn|relay|edge|gateway|tunnel|front|shared|provodnik")
 EGRESS_FOREIGN = ("github.com", "deb.debian.org", "www.google.com", "www.cloudflare.com")
 EGRESS_HOSTS = EGRESS_FOREIGN + ("ya.ru",)
 EXIT_CONF = os.environ.get("XRAY_EXIT_CONF", "/usr/local/etc/xray/config.json")
+INSTALLED_TOOL = os.environ.get("EXITCTL_INSTALLED", "/usr/local/bin/exitctl")
 RE_SERVICE = re.compile(
     r"(^|[.-])(mail|smtp|imap|pop3?|mx|ns|dns|ftp|cpanel|whm|webmail|autodiscover|autoconfig"
     r"|panel|admin|billing|vps|vds|srv|server|host|node|test|dev|staging|localhost|cdn|api)\d*([.-]|$)")
@@ -377,13 +379,17 @@ def cmd_check(as_json=False):
         print(json.dumps(rows, ensure_ascii=False, indent=2))
 
 
-def cmd_direct(action, domain=None):
+def cmd_direct(action, domain=None, as_json=False):
     base, ex = load(BASE), load(EXITS, {"outbounds": []})
     rules = base["routing"]["rules"]
     r = find_rule(base, RULE_DIRECT)
     doms = list(r["domain"]) if r else []
     if action == "list":
-        print("\n".join(d.replace("domain:", "") for d in doms) or "Список пуст.")
+        names = [d.replace("domain:", "") for d in doms]
+        if as_json:
+            print(json.dumps(names, ensure_ascii=False))
+        else:
+            print("\n".join(names) or "Список пуст.")
         return
     if not domain:
         die("укажите домен, например: exitctl direct add gosuslugi.ru")
@@ -1055,6 +1061,15 @@ def capabilities(egress):
             "bridge": foreign_open or bool(egress.get("ya.ru"))}
 
 
+def file_sha256(path):
+    """SHA-256 файла или None, если его нет: так приложение видит, устарел ли установленный exitctl."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def status_report():
     meminfo = dict(re.findall(r"^(\w+):\s+(\d+) kB", read_file("/proc/meminfo") or "", re.M))
     mem_total, mem_avail = meminfo.get("MemTotal"), meminfo.get("MemAvailable")
@@ -1081,6 +1096,7 @@ def status_report():
             "version": ((run_text(XRAY, "version") or "").splitlines() or [None])[0],
         },
         "installed": os.path.exists(BASE),
+        "tool_sha256": file_sha256(INSTALLED_TOOL),
         "mode": None, "sni": None, "port": None, "users": None, "exits": None,
     }
     if rep["installed"]:
@@ -1187,7 +1203,8 @@ def main(a):
     elif c == "check":
         cmd_check("--json" in a[1:])
     elif c == "direct" and len(a) >= 2:
-        cmd_direct(a[1], a[2] if len(a) > 2 else None)
+        rest = [x for x in a[2:] if x != "--json"]
+        cmd_direct(a[1], rest[0] if rest else None, "--json" in a[2:])
     elif c == "sni":
         cmd_sni(a[1:])
     elif c == "user":

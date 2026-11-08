@@ -10,7 +10,7 @@ import (
 )
 
 // Names — файлы, которые заливаются на сервер.
-var Names = []string{"exitctl", "simple-setup.sh", "bridge-setup.sh", "exit-setup.sh", "prepare-restricted.sh", "uninstall.sh", "update-geodata.sh"}
+var Names = []string{"exitctl", "simple-setup.sh", "bridge-setup.sh", "exit-setup.sh", "prepare-restricted.sh", "uninstall.sh", "update-geodata.sh", "update-xray.sh"}
 
 //go:embed files
 var files embed.FS

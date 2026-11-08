@@ -66,4 +66,4 @@ LimitNOFILE=1000000
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-echo "Xray $(/usr/local/bin/xray version | head -1) установлен из файлов приложения."
+echo "Xray $(/usr/local/bin/xray version | awk 'NR==1{print $2}') установлен из файлов приложения."

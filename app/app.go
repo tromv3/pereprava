@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -353,7 +355,79 @@ func (a *App) Status(id string) (any, error) {
 	if err := a.ensurePython(id); err != nil {
 		return nil, err
 	}
-	return a.tool(id, false, "status", "--json")
+	st, err := a.tool(id, false, "status", "--json")
+	if err != nil {
+		return nil, err
+	}
+	// Интерфейс сравнивает с tool_sha256 и предлагает обновить exitctl на сервере.
+	if m, ok := st.(map[string]any); ok {
+		if data, err := bundle.Read("exitctl"); err == nil {
+			sum := sha256.Sum256(data)
+			m["bundled_tool_sha256"] = hex.EncodeToString(sum[:])
+		}
+	}
+	return st, nil
+}
+
+// UpdateTool ставит на сервер exitctl из приложения: для тех, кто пользуется им в консоли сервера.
+func (a *App) UpdateTool(id string) error {
+	c, err := a.connect(id)
+	if err != nil {
+		return err
+	}
+	r, err := c.client.Run(a.ctx, "install -m 755 "+remote.Quote(c.dir+"/exitctl")+" /usr/local/bin/exitctl", true, nil)
+	if err != nil {
+		return err
+	}
+	if r.Code != 0 {
+		return commandError(r)
+	}
+	return nil
+}
+
+// UpdateXray скачивает последний Xray на этом компьютере и ставит его на сервер.
+func (a *App) UpdateXray(id string) error {
+	c, err := a.connect(id)
+	if err != nil {
+		return err
+	}
+	r, err := c.client.Run(a.ctx, "uname -m", false, nil)
+	if err != nil {
+		return err
+	}
+	a.emit("Скачиваю последний Xray на этом компьютере...")
+	files, err := xraydist.Download(a.ctx, strings.TrimSpace(r.Stdout))
+	if err != nil {
+		return err
+	}
+	dir := c.dir + "/xray-new"
+	if r, err := c.client.Run(a.ctx, "mkdir -p "+remote.Quote(dir), false, nil); err != nil {
+		return err
+	} else if r.Code != 0 {
+		return commandError(r)
+	}
+	a.emit("Заливаю Xray на сервер...")
+	if err := c.client.Upload(a.ctx, dir+"/xray", files["xray"], "700"); err != nil {
+		return err
+	}
+	return a.runScript(c, "update-xray.sh", " "+remote.Quote(dir), "обновление Xray не удалось")
+}
+
+// ListDirect возвращает свои домены, которые мост открывает напрямую.
+func (a *App) ListDirect(id string) (any, error) { return a.tool(id, false, "direct", "list", "--json") }
+
+// AddDirect добавляет домен в список «напрямую». Xray при этом перезапускается.
+func (a *App) AddDirect(id, domain string) error {
+	domain = strings.TrimSpace(domain)
+	if !reDomain.MatchString(domain) {
+		return errors.New("это не похоже на домен")
+	}
+	return a.plainTool(id, "direct", "add", domain)
+}
+
+// RemoveDirect убирает домен из списка «напрямую». Xray при этом перезапускается.
+func (a *App) RemoveDirect(id, domain string) error {
+	return a.plainTool(id, "direct", "remove", domain)
 }
 
 // ScanSNI подбирает домены в /24 сервера.
