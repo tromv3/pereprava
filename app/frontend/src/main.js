@@ -344,8 +344,9 @@ function exitsPanel(server) {
       return;
     }
     const dead = exits.filter((x) => !health[x.name]?.ok).map((x) => x.name);
-    list.replaceChildren(
-      dead.length ? h('div', { class: 'notice' }, `Мост не достаёт до: ${dead.join(', ')}. Проверьте адрес выхода и то, что при его установке указан IP этого моста. Если выход настроен верно, значит хостер моста ограничивает исходящий трафик, и нужен выход в другой сети.`) : null,
+    // replaceChildren превращает null в текст «null», поэтому пустые элементы отфильтровываются.
+    list.replaceChildren(...[
+      dead.length ? h('div', { class: 'notice' }, `Мост не достаёт до: ${dead.join(', ')}. Проверьте адрес выхода и то, что при его установке указан IP этого моста. Если выход настроен верно, значит соединения режет хостер одного из серверов, и нужен выход в другой сети.`) : null,
       h('p', { class: 'hint', style: 'margin-bottom:8px' }, data.pinned ? `Весь трафик идёт через «${data.pinned}».` : 'Автовыбор: самый быстрый живой выход.'),
       h('table', {},
         h('thead', {}, h('tr', {}, ['Имя', 'Адрес', 'Связь с моста', ''].map((t) => h('th', {}, t)))),
@@ -356,7 +357,7 @@ function exitsPanel(server) {
             data.pinned === x.name
               ? h('button', { onclick: () => act(() => AutoExit(server.id)) }, 'Автовыбор')
               : h('button', { onclick: () => act(() => UseExit(server.id, x.name)) }, 'Только через него'),
-            h('button', { class: 'danger', onclick: () => remove(x) }, 'Удалить')))))));
+            h('button', { class: 'danger', onclick: () => remove(x) }, 'Удалить'))))))].filter(Boolean));
   }
 
   async function remove(x) {
