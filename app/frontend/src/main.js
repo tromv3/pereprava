@@ -1,6 +1,6 @@
 import './style.css';
 import {
-  AddExit, AddUser, AutoExit, CheckExits, CheckSNI, DeleteServer, ExitLink, Install, ListExits,
+  AddExit, AddUser, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Install, ListExits,
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
   UpdateGeodata, UseExit,
 } from '../wailsjs/go/main/App';
@@ -213,6 +213,12 @@ async function removeServer(server) {
   goHome();
 }
 
+// Результат exitctl reach: связь между двумя серверами из списка.
+function reachNotice(rep, fromName, toName) {
+  if (rep.ok) return h('p', { class: 'hint pass' }, `${fromName} достаёт до ${toName}: связь есть.`);
+  return h('div', { class: 'notice' }, `${fromName} не достаёт до ${toName}: ${rep.message}.`);
+}
+
 const MODE_NAMES = { simple: 'простой режим', bridge: 'мост', exit: 'выход' };
 
 function statusPanel(st) {
@@ -362,12 +368,16 @@ function exitsPanel(server) {
   source.addEventListener('change', async () => {
     if (!source.value) return;
     errorBox.replaceChildren();
+    const exitServer = state.servers.find((s) => s.id === source.value);
+    source.value = '';
     try {
-      linkInput.value = await withHost(source.value, () => ExitLink(source.value));
+      linkInput.value = await withHost(exitServer.id, () => ExitLink(exitServer.id));
+      if (!nameInput.value) nameInput.value = exitServer.name.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32);
+      const rep = await CheckReach(server.id, exitServer.id);
+      if (!rep.ok) errorBox.replaceChildren(reachNotice(rep, 'Этот мост', `«${exitServer.name}»`));
     } catch (e) {
       showError(e);
     }
-    source.value = '';
   });
 
   addBtn.addEventListener('click', async () => {
@@ -408,8 +418,28 @@ function installPanel(server, st) {
   let mode = allowed[0];
   const modeHint = h('p', { class: 'hint' }, MODE_HINTS[mode]);
   const bridgeIp = h('input', { placeholder: 'например 185.0.0.1' });
-  const bridgeBox = h('label', { class: 'field', hidden: mode !== 'exit', style: 'margin-top:10px' },
-    h('span', {}, 'IP-адрес моста, который будет подключаться к этому выходу'), bridgeIp);
+  const reachBox = h('div');
+  const bridgePick = h('select', { style: 'width:auto' }, h('option', { value: '' }, 'Мост из списка...'),
+    state.servers.filter((s) => s.id !== server.id).map((s) => h('option', { value: s.id }, s.name)));
+  bridgePick.addEventListener('change', async () => {
+    const bridge = state.servers.find((s) => s.id === bridgePick.value);
+    bridgePick.value = '';
+    if (!bridge) return;
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(bridge.host)) bridgeIp.value = bridge.host;
+    reachBox.replaceChildren(h('p', { class: 'hint' }, `Проверяю, достаёт ли «${bridge.name}» до этого сервера...`));
+    try {
+      const rep = await withHost(bridge.id, () => CheckReach(bridge.id, server.id));
+      reachBox.replaceChildren(reachNotice(rep, `«${bridge.name}»`, 'этого сервера'));
+    } catch (e) {
+      reachBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+    }
+  });
+  const bridgeBox = h('div', { hidden: mode !== 'exit', style: 'margin-top:10px' },
+    h('label', { class: 'field', style: 'margin-bottom:4px' },
+      h('span', {}, 'IP-адрес моста, который будет подключаться к этому выходу'),
+      h('div', { class: 'row' }, bridgeIp, bridgePick)),
+    h('p', { class: 'hint' }, 'Если мост уже есть в списке, выберите его: приложение заранее проверит, достаёт ли он до этого сервера.'),
+    reachBox);
   const modeRadios = Object.keys(MODE_NAMES).map((m) => {
     const radio = h('input', { type: 'radio', name: 'mode', checked: m === mode, disabled: !allowed.includes(m), style: 'width:auto;margin-right:6px' });
     radio.addEventListener('change', () => {
@@ -577,7 +607,7 @@ function usersPanel(server) {
 
   async function remove(u) {
     const ok = await confirmDialog('Удалить пользователя?',
-      `«${u.name}» больше не сможет подключиться. Xray перезапустится, у всех подключённых будет короткий обрыв, а счётчики трафика обнулятся.`, 'Удалить');
+      `«${u.name}» больше не сможет подключиться.`, 'Удалить');
     if (!ok) return;
     errorBox.replaceChildren();
     try {
@@ -606,7 +636,7 @@ function usersPanel(server) {
   load();
   return h('div', { class: 'panel' }, h('h3', {}, 'Пользователи'), errorBox,
     h('div', { class: 'row', style: 'margin-bottom:10px' }, nameInput, addBtn),
-    h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'Добавление и удаление перезапускают Xray: будет короткий обрыв. Трафик считается с последнего перезапуска.'),
+    h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'Пользователи добавляются и удаляются без обрыва связи. На серверах, настроенных старой версией, первое такое изменение один раз перезапустит Xray. Трафик считается с последнего перезапуска Xray.'),
     list);
 }
 

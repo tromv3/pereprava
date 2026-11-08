@@ -18,6 +18,10 @@ export function CheckExits(arg1) {
   return window['go']['main']['App']['CheckExits'](arg1);
 }
 
+export function CheckReach(arg1, arg2) {
+  return window['go']['main']['App']['CheckReach'](arg1, arg2);
+}
+
 export function CheckSNI(arg1, arg2) {
   return window['go']['main']['App']['CheckSNI'](arg1, arg2);
 }

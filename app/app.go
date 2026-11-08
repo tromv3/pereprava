@@ -551,6 +551,19 @@ func (a *App) plainTool(id string, args ...string) error {
 	return nil
 }
 
+// CheckReach проверяет с сервера fromID, достаёт ли он до SSH-порта сервера toID.
+// Порт SSH открыт ещё до установки выхода, поэтому проверка работает заранее.
+func (a *App) CheckReach(fromID, toID string) (any, error) {
+	to, err := a.store.Get(toID)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.ensurePython(fromID); err != nil {
+		return nil, err
+	}
+	return a.tool(fromID, false, "reach", to.Host, strconv.Itoa(to.Port), "--json")
+}
+
 // ListExits возвращает выходы моста и закреплённый выход.
 func (a *App) ListExits(id string) (any, error) { return a.tool(id, false, "list", "--json") }
 

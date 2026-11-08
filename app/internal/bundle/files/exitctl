@@ -19,8 +19,9 @@
   exitctl user link <имя> [--host АДРЕС]           показать ссылку пользователя
   exitctl user remove <имя>                        удалить пользователя
   exitctl status [--json]                          состояние сервера и Xray
+  exitctl reach <адрес> <порт> [--json]            достаёт ли этот сервер до адреса (код 1 — нет)
 """
-import contextlib, ipaddress, json, os, re, shutil, socket, ssl, statistics, subprocess, sys, time, uuid
+import contextlib, ipaddress, json, os, re, shutil, socket, ssl, statistics, subprocess, sys, tempfile, time, uuid
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import urlopen
@@ -111,8 +112,8 @@ def sync_fallback(base, ex):
         b.pop("fallbackTag", None)
 
 
-def apply(base, ex):
-    """Сохранить, проверить конфиг, перезапустить; при ошибке откатить."""
+def write_and_test(base, ex):
+    """Сохранить и проверить конфиг; при ошибке откатить."""
     backups = {}
     for p in (BASE, EXITS):
         if os.path.exists(p):
@@ -127,6 +128,9 @@ def apply(base, ex):
             shutil.copy2(b, p)
         out = (test.stdout + test.stderr).strip().splitlines()
         die("конфиг не прошёл проверку, изменения отменены:\n  " + "\n  ".join(out[-5:]))
+
+
+def restart_xray():
     if NO_RESTART:
         print("Конфиг OK (перезапуск пропущен: XRAY_NO_RESTART=1)")
         return
@@ -138,6 +142,57 @@ def apply(base, ex):
     if st.stdout.strip() != "active":
         die("xray не запустился, смотрите: journalctl -u xray -n 50")
     print("Xray перезапущен.")
+
+
+def apply(base, ex):
+    """Сохранить, проверить конфиг, перезапустить; при ошибке проверки откатить."""
+    write_and_test(base, ex)
+    restart_xray()
+
+
+def live_users_ok(base):
+    """Можно ли менять пользователей через API, без перезапуска Xray."""
+    services = (base.get("api") or {}).get("services") or []
+    return "HandlerService" in services and run_text("systemctl", "is-active", "xray") == "active"
+
+
+def api_call(*args):
+    try:
+        r = subprocess.run([XRAY, "api", args[0], f"--server={API_SERVER}", *args[1:]],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def apply_user_change(base, ex, action, client):
+    """Записать конфиг и применить изменение пользователя. True, если Xray пришлось перезапустить.
+
+    Конфиг на диске меняется всегда, чтобы после любого перезапуска состояние совпадало.
+    Запущенному Xray изменение передаётся через API; если API недоступен или отказал — перезапуск.
+    """
+    if not live_users_ok(base):
+        apply(base, ex)
+        return True
+    write_and_test(base, ex)
+    if action == "add":
+        ib = json.loads(json.dumps(inbound_in(base)))
+        ib["settings"]["clients"] = [client]
+        fd, path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({"inbounds": [ib]}, f)
+            ok = api_call("adu", path)
+        finally:
+            os.remove(path)
+    else:
+        ok = api_call("rmu", "-tag=in", client_name(client))
+    if ok:
+        print("Изменение применено без перезапуска Xray.")
+        return False
+    print("Не удалось применить изменение на лету, перезапускаю Xray.")
+    restart_xray()
+    return True
 
 
 def clean_name(s):
@@ -919,6 +974,10 @@ def cmd_user(a):
     if not clean:
         die("в имени нужны латинские буквы, цифры, - или _")
     found = next((c for c in clients if client_name(c) == clean), None)
+    # Серверы, поставленные до появления изменений на лету: включаем HandlerService.
+    # Это меняет настройки API, поэтому в этот раз Xray всё равно перезапустится.
+    api = base.get("api")
+    upgrade = bool(api) and "HandlerService" not in (api.get("services") or [])
 
     if action == "link":
         if not found:
@@ -928,10 +987,17 @@ def cmd_user(a):
     elif action == "add":
         if found:
             die(f"пользователь «{clean}» уже есть")
-        clients.append({"id": str(uuid.uuid4()), "flow": "xtls-rprx-vision", "email": clean})
+        client = {"id": str(uuid.uuid4()), "flow": "xtls-rprx-vision", "email": clean}
+        clients.append(client)
         with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
-            apply(base, ex)
+            if upgrade:
+                api.setdefault("services", []).append("HandlerService")
+                apply(base, ex)
+                restarted = True
+            else:
+                restarted = apply_user_change(base, ex, "add", client)
         user = next(u for u in users_report(base, host) if u["name"] == clean)
+        user["restarted"] = restarted
         if as_json:
             print(json.dumps(user, ensure_ascii=False, indent=2))
         else:
@@ -943,7 +1009,11 @@ def cmd_user(a):
         if len(clients) == 1:
             die("нельзя удалить последнего пользователя: к серверу некому будет подключиться")
         clients.remove(found)
-        apply(base, ex)
+        if upgrade:
+            api.setdefault("services", []).append("HandlerService")
+            apply(base, ex)
+        else:
+            apply_user_change(base, ex, "remove", found)
         print(f"Удалён пользователь «{clean}».")
 
 
@@ -1058,6 +1128,47 @@ def cmd_status(a):
         print("Xray через эти скрипты не настроен.")
 
 
+def reach_report(host, port):
+    """Достаёт ли этот сервер до host:port. Отказ в соединении — тоже связь: порт просто закрыт."""
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            tcp = "open"
+    except ConnectionRefusedError:
+        tcp = "refused"
+    except socket.timeout:
+        tcp = "timeout"
+    except OSError as e:
+        tcp = "error: " + (e.strerror or e.__class__.__name__)
+    icmp = run_text("ping", "-c", "2", "-W", "2", host) is not None
+    ok = tcp in ("open", "refused")
+    if ok:
+        msg = "связь есть"
+    elif icmp:
+        # Чья сторона режет, отсюда не видно: так ведёт себя и фильтр исходящего трафика
+        # у хостера этого сервера, и фильтр входящего у хостера адреса.
+        msg = ("пинг проходит, а TCP-соединения нет: соединения режет хостер одного из серверов "
+               "или сеть между ними. Связать эти два сервера не получится")
+    else:
+        msg = "нет ни TCP-соединения, ни пинга: адрес недоступен, выключен или закрыт файрволом"
+    return {"host": host, "port": port, "tcp": tcp, "icmp": icmp, "ok": ok, "message": msg}
+
+
+def cmd_reach(a):
+    args = [x for x in a if x != "--json"]
+    if len(args) != 2 or not args[1].isdigit() or not 1 <= int(args[1]) <= 65535:
+        die("используйте: exitctl reach <адрес> <порт> [--json]")
+    if not re.fullmatch(r"[A-Za-z0-9.:-]+", args[0]):
+        die(f"неверный адрес {args[0]}")
+    rep = reach_report(args[0], int(args[1]))
+    if "--json" in a:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    else:
+        icmp = "есть" if rep["icmp"] else "нет"
+        print(f'{rep["host"]}:{rep["port"]} — {rep["message"]} (TCP: {rep["tcp"]}, пинг: {icmp})')
+    if not rep["ok"]:
+        sys.exit(1)
+
+
 def main(a):
     if not a or a[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
@@ -1083,6 +1194,8 @@ def main(a):
         cmd_user(a[1:])
     elif c == "status":
         cmd_status(a[1:])
+    elif c == "reach":
+        cmd_reach(a[1:])
     else:
         print(__doc__.strip())
         sys.exit(1)

@@ -10,6 +10,8 @@ export function AutoExit(arg1:string):Promise<void>;
 
 export function CheckExits(arg1:string):Promise<any>;
 
+export function CheckReach(arg1:string,arg2:string):Promise<any>;
+
 export function CheckSNI(arg1:string,arg2:string):Promise<any>;
 
 export function DeleteServer(arg1:string):Promise<void>;
