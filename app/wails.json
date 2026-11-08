@@ -1,0 +1,13 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "vless-bridge",
+  "outputfilename": "vless-bridge",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "http://127.0.0.1:5199",
+  "author": {
+    "name": "tromv",
+    "email": "tromv3@ya.ru"
+  }
+}

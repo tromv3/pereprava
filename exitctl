@@ -1,0 +1,1092 @@
+#!/usr/bin/env python3
+"""exitctl — управление выходными нодами на мосту Xray.
+
+  exitctl list [--json]            список выходов и текущий режим
+  exitctl add <vless://...> [имя]  добавить выход
+  exitctl remove <имя>             удалить выход
+  exitctl use <имя>                весь трафик через один выход
+  exitctl auto                     автовыбор самого быстрого живого выхода
+  exitctl check [--json]           проверить доступность выходов (TCP)
+  exitctl direct add <домен>       пускать домен напрямую с моста
+  exitctl direct remove <домен>    убрать домен из списка «напрямую»
+  exitctl direct list              список своих доменов «напрямую»
+  exitctl sni check <домен> [--ip IP] [--tries N] [--json]
+                                   проверить домен для SNI (код выхода 1 — не подходит)
+  exitctl sni scan [--ip IP] [--role bridge|exit] [--top N] [--workers N] [--max-checks N] [--json]
+                                   подобрать SNI в /24 сервера (код выхода 1 — ничего не найдено)
+  exitctl user list [--host АДРЕС] [--json]        пользователи, трафик и ссылки
+  exitctl user add <имя> [--host АДРЕС] [--json]   добавить пользователя
+  exitctl user link <имя> [--host АДРЕС]           показать ссылку пользователя
+  exitctl user remove <имя>                        удалить пользователя
+  exitctl status [--json]                          состояние сервера и Xray
+"""
+import contextlib, ipaddress, json, os, re, shutil, socket, ssl, statistics, subprocess, sys, time, uuid
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit, parse_qs, unquote
+from urllib.request import urlopen
+
+CONF_DIR = os.environ.get("XRAY_CONF_DIR", "/usr/local/etc/xray/conf.d")
+XRAY = os.environ.get("XRAY_BIN", "/usr/local/bin/xray")
+BASE = os.path.join(CONF_DIR, "00_base.json")
+EXITS = os.path.join(CONF_DIR, "20_exits.json")
+NO_RESTART = os.environ.get("XRAY_NO_RESTART") == "1"
+PREFIX = "exit-"
+RULE_EXITS = "to-exits"
+RULE_DIRECT = "user-direct"
+API_SERVER = "127.0.0.1:10085"
+SNI_PORT = 443
+SNI_TIMEOUT = 6
+SNI_MAX_RTT_MS = 30
+SNI_CERT_MIN_DAYS = 14
+SCAN_TIMEOUT = 3
+SCAN_NAMES_PER_HOST = 10   # сколько имён сертификата резолвить на одном хосте
+SCAN_CHECKS_PER_HOST = 2   # сколько имён полностью проверять на одном хосте
+RU_TLDS = ("ru", "su", "xn--p1ai")
+RE_RDNS = re.compile(r"\d{1,3}[.-]\d{1,3}[.-]\d{1,3}[.-]\d{1,3}")
+RE_VPN = re.compile(r"vpn|vless|vmess|xray|v2ray|trojan|shadowsocks|wireguard|amnezia|outline|proxy|reality")
+# Метка вида cf-us-01, ru1, usa07, msk-3: так обычно называют ноды VPN и CDN.
+RE_NODE = re.compile(r"^(?:[a-z]{2,3}-)?(?:us|usa|nl|de|fi|fr|uk|gb|se|ch|at|pl|lv|lt|ee|kz|tr"
+                     r"|sg|jp|hk|ca|ru|msk|spb|eu|am|ge)-?\d{1,3}$")
+RE_RANDOM = re.compile(r"[bcdfghjklmnpqrstvwxz]{5,}")
+RE_INFRA = re.compile(r"cdn|relay|edge|gateway|tunnel|front|shared|provodnik")
+EGRESS_FOREIGN = ("github.com", "deb.debian.org", "www.google.com", "www.cloudflare.com")
+EGRESS_HOSTS = EGRESS_FOREIGN + ("ya.ru",)
+EXIT_CONF = os.environ.get("XRAY_EXIT_CONF", "/usr/local/etc/xray/config.json")
+RE_SERVICE = re.compile(
+    r"(^|[.-])(mail|smtp|imap|pop3?|mx|ns|dns|ftp|cpanel|whm|webmail|autodiscover|autoconfig"
+    r"|panel|admin|billing|vps|vds|srv|server|host|node|test|dev|staging|localhost|cdn|api)\d*([.-]|$)")
+RE_BRAND = re.compile(
+    r"(^|[.-])(google|gstatic|youtube|apple|icloud|microsoft|bing|azure|amazon|aws|cloudflare"
+    r"|facebook|instagram|whatsapp|telegram|samsung|nvidia|yandex|vk|sber|gosuslugi|tinkoff"
+    r"|tbank|ozon|wildberries|rutube)([.-]|$)")
+
+
+def die(msg):
+    print("Ошибка: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def load(path, default=None):
+    if not os.path.exists(path):
+        if default is not None:
+            return default
+        die(f"не найден {path}")
+    with open(path) as f:
+        return json.load(f)
+
+
+def save(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def exits_list(ex):
+    return [o for o in ex.get("outbounds", []) if o.get("tag", "").startswith(PREFIX)]
+
+
+def find_rule(base, tag):
+    for r in base.get("routing", {}).get("rules", []):
+        if r.get("ruleTag") == tag:
+            return r
+    return None
+
+
+def balancer(base):
+    for b in base.get("routing", {}).get("balancers", []):
+        if b.get("tag") == "exits":
+            return b
+    die("в 00_base.json нет балансировщика с тегом exits")
+
+
+def sync_fallback(base, ex):
+    """fallbackTag = первый выход, чтобы трафик шёл, пока observatory не проверил выходы."""
+    b = balancer(base)
+    tags = [o["tag"] for o in exits_list(ex)]
+    if tags:
+        b["fallbackTag"] = tags[0]
+    else:
+        b.pop("fallbackTag", None)
+
+
+def apply(base, ex):
+    """Сохранить, проверить конфиг, перезапустить; при ошибке откатить."""
+    backups = {}
+    for p in (BASE, EXITS):
+        if os.path.exists(p):
+            shutil.copy2(p, p + ".bak")
+            backups[p] = p + ".bak"
+    save(BASE, base)
+    save(EXITS, ex)
+    test = subprocess.run([XRAY, "run", "-test", "-confdir", CONF_DIR],
+                          capture_output=True, text=True)
+    if test.returncode != 0:
+        for p, b in backups.items():
+            shutil.copy2(b, p)
+        out = (test.stdout + test.stderr).strip().splitlines()
+        die("конфиг не прошёл проверку, изменения отменены:\n  " + "\n  ".join(out[-5:]))
+    if NO_RESTART:
+        print("Конфиг OK (перезапуск пропущен: XRAY_NO_RESTART=1)")
+        return
+    r = subprocess.run(["systemctl", "restart", "xray"], capture_output=True, text=True)
+    if r.returncode != 0:
+        die("не удалось перезапустить xray: " + r.stderr.strip())
+    time.sleep(1)
+    st = subprocess.run(["systemctl", "is-active", "xray"], capture_output=True, text=True)
+    if st.stdout.strip() != "active":
+        die("xray не запустился, смотрите: journalctl -u xray -n 50")
+    print("Xray перезапущен.")
+
+
+def clean_name(s):
+    s = unquote(s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9_-]+", "-", s).strip("-")
+    return s[:32]
+
+
+def parse_vless(link, name=None):
+    if not link.startswith("vless://"):
+        die("ссылка должна начинаться с vless://")
+    u = urlsplit(link)
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    uid = unquote(u.username or "")
+    host = u.hostname
+    try:
+        port = u.port or 443
+    except ValueError:
+        die("неверный порт в ссылке")
+    if not uid or not host:
+        die("в ссылке нет UUID или адреса")
+
+    net = q.get("type", "tcp")
+    if net == "raw":
+        net = "tcp"
+    sec = q.get("security", "none")
+    user = {"id": uid, "encryption": q.get("encryption", "none")}
+    if q.get("flow"):
+        user["flow"] = q["flow"]
+
+    ss = {"network": net, "security": sec}
+    if sec == "reality":
+        if not q.get("pbk"):
+            die("для reality в ссылке нужен pbk (публичный ключ)")
+        rs = {"serverName": q.get("sni", ""), "publicKey": q["pbk"],
+              "shortId": q.get("sid", ""), "fingerprint": q.get("fp", "chrome")}
+        if q.get("spx"):
+            rs["spiderX"] = q["spx"]
+        ss["realitySettings"] = rs
+    elif sec == "tls":
+        ts = {"serverName": q.get("sni", host), "fingerprint": q.get("fp", "chrome")}
+        if q.get("alpn"):
+            ts["alpn"] = q["alpn"].split(",")
+        ss["tlsSettings"] = ts
+    elif sec != "none":
+        die(f"неизвестный security={sec}")
+
+    if net == "ws":
+        ss["wsSettings"] = {"path": q.get("path", "/"), "host": q.get("host", "")}
+    elif net == "grpc":
+        ss["grpcSettings"] = {"serviceName": q.get("serviceName", "")}
+    elif net == "xhttp":
+        xs = {"path": q.get("path", "/"), "host": q.get("host", "")}
+        if q.get("mode"):
+            xs["mode"] = q["mode"]
+        ss["xhttpSettings"] = xs
+    elif net == "httpupgrade":
+        ss["httpupgradeSettings"] = {"path": q.get("path", "/"), "host": q.get("host", "")}
+    elif net != "tcp":
+        die(f"неподдерживаемый type={net}")
+
+    nm = clean_name(name) or clean_name(u.fragment) or clean_name(host.replace(".", "-"))
+    return {
+        "tag": PREFIX + nm,
+        "protocol": "vless",
+        "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
+        "streamSettings": ss,
+    }
+
+
+def info(o):
+    v = o["settings"]["vnext"][0]
+    s = o.get("streamSettings", {})
+    return v["address"], v["port"], f'{s.get("network", "tcp")}/{s.get("security", "none")}'
+
+
+def mode_str(base):
+    r = find_rule(base, RULE_EXITS)
+    if r and r.get("outboundTag"):
+        return "закреплён выход " + r["outboundTag"][len(PREFIX):]
+    return "авто (самый быстрый живой выход)"
+
+
+def cmd_list(as_json=False):
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    items = exits_list(ex)
+    if as_json:
+        r = find_rule(base, RULE_EXITS)
+        pinned = r.get("outboundTag") if r else None
+        rows = []
+        for o in items:
+            a, p, t = info(o)
+            rows.append({"name": o["tag"][len(PREFIX):], "address": a, "port": p, "transport": t})
+        print(json.dumps({"pinned": pinned[len(PREFIX):] if pinned else None, "exits": rows},
+                         ensure_ascii=False, indent=2))
+        return
+    print("Режим:", mode_str(base))
+    if not items:
+        print("Выходов нет. Добавьте: exitctl add 'vless://...' имя")
+        return
+    print(f'{"ИМЯ":<20} {"АДРЕС":<28} {"ПОРТ":<6} ТРАНСПОРТ')
+    for o in items:
+        a, p, t = info(o)
+        print(f'{o["tag"][len(PREFIX):]:<20} {a:<28} {p:<6} {t}')
+
+
+def cmd_add(link, name=None):
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    ex.setdefault("outbounds", [])
+    o = parse_vless(link, name)
+    if any(x.get("tag") == o["tag"] for x in ex["outbounds"]):
+        die(f'выход «{o["tag"][len(PREFIX):]}» уже есть. Удалите его или укажите другое имя.')
+    ex["outbounds"].append(o)
+    sync_fallback(base, ex)
+    apply(base, ex)
+    a, p, t = info(o)
+    print(f'Добавлен выход «{o["tag"][len(PREFIX):]}»: {a}:{p} ({t})')
+
+
+def cmd_remove(name):
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    tag = PREFIX + clean_name(name)
+    before = len(ex.get("outbounds", []))
+    ex["outbounds"] = [o for o in ex.get("outbounds", []) if o.get("tag") != tag]
+    if len(ex["outbounds"]) == before:
+        die(f"выход «{name}» не найден (смотрите exitctl list)")
+    r = find_rule(base, RULE_EXITS)
+    if r and r.get("outboundTag") == tag:
+        r.pop("outboundTag")
+        r["balancerTag"] = "exits"
+        print("Удалённый выход был закреплён — включён режим авто.")
+    sync_fallback(base, ex)
+    apply(base, ex)
+    print(f"Удалён выход «{clean_name(name)}».")
+    if not exits_list(ex):
+        print("Внимание: выходов не осталось, зарубежные сайты работать не будут.")
+
+
+def cmd_use(name):
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    tag = PREFIX + clean_name(name)
+    if tag not in [o["tag"] for o in exits_list(ex)]:
+        die(f"выход «{name}» не найден (смотрите exitctl list)")
+    r = find_rule(base, RULE_EXITS) or die("в 00_base.json нет правила to-exits")
+    r.pop("balancerTag", None)
+    r["outboundTag"] = tag
+    apply(base, ex)
+    print(f"Весь трафик теперь идёт через «{clean_name(name)}».")
+
+
+def cmd_auto():
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    r = find_rule(base, RULE_EXITS) or die("в 00_base.json нет правила to-exits")
+    r.pop("outboundTag", None)
+    r["balancerTag"] = "exits"
+    sync_fallback(base, ex)
+    apply(base, ex)
+    print("Включён автовыбор самого быстрого живого выхода.")
+
+
+def cmd_check(as_json=False):
+    ex = load(EXITS, {"outbounds": []})
+    items = exits_list(ex)
+    rows = []
+    if not items and not as_json:
+        print("Выходов нет.")
+        return
+    for o in items:
+        a, p, _ = info(o)
+        t0 = time.time()
+        try:
+            with socket.create_connection((a, p), timeout=4):
+                ms = int((time.time() - t0) * 1000)
+                res, ok = f"OK, {ms} мс", True
+        except OSError as e:
+            ms, ok = None, False
+            res = f"НЕДОСТУПЕН ({e.__class__.__name__})"
+        rows.append({"name": o["tag"][len(PREFIX):], "ok": ok, "ms": ms})
+        if not as_json:
+            print(f'{o["tag"][len(PREFIX):]:<20} {a}:{p:<6} {res}')
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+
+
+def cmd_direct(action, domain=None):
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    rules = base["routing"]["rules"]
+    r = find_rule(base, RULE_DIRECT)
+    doms = list(r["domain"]) if r else []
+    if action == "list":
+        print("\n".join(d.replace("domain:", "") for d in doms) or "Список пуст.")
+        return
+    if not domain:
+        die("укажите домен, например: exitctl direct add gosuslugi.ru")
+    d = "domain:" + domain.strip().lower().removeprefix("https://").removeprefix("http://").split("/")[0]
+    if action == "add":
+        if d in doms:
+            die("домен уже в списке")
+        doms.append(d)
+    elif action == "remove":
+        if d not in doms:
+            die("домена нет в списке")
+        doms.remove(d)
+    else:
+        die("используйте: direct add|remove|list")
+    if r:
+        rules.remove(r)
+    if doms:
+        rules.insert(0, {"ruleTag": RULE_DIRECT, "domain": doms, "outboundTag": "direct"})
+    apply(base, ex)
+    print(("Добавлен" if action == "add" else "Удалён") + f" {d[7:]}")
+
+
+def normalize_domain(s):
+    d = s.strip().lower().removeprefix("https://").removeprefix("http://")
+    d = d.split("/")[0].split(":")[0].rstrip(".")
+    try:
+        d = d.encode("idna").decode()
+    except UnicodeError:
+        return None
+    ok = re.fullmatch(r"([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9]", d)
+    return d if ok else None
+
+
+def detect_server_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("1.1.1.1", 53))
+            ip = s.getsockname()[0]
+        if ipaddress.ip_address(ip).is_global:
+            return ip
+    except OSError:
+        pass
+    try:
+        with urlopen("https://api.ipify.org", timeout=5) as r:
+            ip = r.read().decode().strip()
+        ipaddress.ip_address(ip)
+        return ip
+    except (OSError, ValueError):
+        return None
+
+
+def resolve_ipv4(domain):
+    try:
+        infos = socket.getaddrinfo(domain, SNI_PORT, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return []
+    return sorted({i[4][0] for i in infos})
+
+
+def sni_context():
+    ctx = ssl.create_default_context()
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.set_alpn_protocols(["h2", "http/1.1"])
+    return ctx
+
+
+def tls_handshake(domain, ip, verify, res):
+    ctx = sni_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    t0 = time.monotonic()
+    with socket.create_connection((ip, SNI_PORT), timeout=SNI_TIMEOUT) as raw:
+        res["tcp_ms"] = round((time.monotonic() - t0) * 1000, 1)
+        with ctx.wrap_socket(raw, server_hostname=domain) as s:
+            res["version"] = s.version()
+            res["alpn"] = s.selected_alpn_protocol()
+            if verify:
+                res["cert"] = s.getpeercert()
+
+
+def probe_tls(domain, ip):
+    res = {"tcp_ms": None, "version": None, "alpn": None, "cert": None,
+           "cert_error": None, "error": None}
+    try:
+        try:
+            tls_handshake(domain, ip, True, res)
+        except ssl.SSLCertVerificationError as e:
+            res["cert_error"] = e.verify_message
+            tls_handshake(domain, ip, False, res)
+    except OSError as e:  # ssl.SSLError тоже OSError
+        res["error"] = str(e) or e.__class__.__name__
+    return res
+
+
+def probe_http(domain, ip):
+    """(версия HTTP, код, ошибка curl) или None, если curl нет.
+
+    Сертификат и h2 проверяет probe_tls, поэтому здесь -k и нет --http2:
+    сборка curl без HTTP/2 с этим флагом вообще не делает запрос.
+    """
+    cmd = ["curl", "-sSk", "-o", os.devnull, "--tlsv1.3",
+           "--max-time", str(SNI_TIMEOUT * 2), "-A", "Mozilla/5.0",
+           "--resolve", f"{domain}:{SNI_PORT}:{ip}",
+           "-w", "%{http_version} %{http_code}", f"https://{domain}/"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return None
+    parts = r.stdout.split()
+    err = r.stderr.strip().splitlines()[0] if r.stderr.strip() else ""
+    return (parts[0], parts[1], err) if len(parts) == 2 else ("0", "000", err)
+
+
+def cert_details(cert):
+    def field(rdns, key):
+        return next((v for rdn in rdns for k, v in rdn if k == key), None)
+    expires = ssl.cert_time_to_seconds(cert["notAfter"])
+    return {
+        "subject": field(cert.get("subject", ()), "commonName"),
+        "issuer": field(cert.get("issuer", ()), "organizationName"),
+        "san": [v for k, v in cert.get("subjectAltName", ()) if k == "DNS"],
+        "days_left": int((expires - time.time()) // 86400),
+    }
+
+
+def sni_check(raw_domain, server_ip=None, tries=3):
+    report = {"domain": raw_domain, "server_ip": server_ip, "verdict": "ok",
+              "checks": [], "details": {}}
+    det = report["details"]
+
+    def add(cid, status, message):
+        report["checks"].append({"id": cid, "status": status, "message": message})
+
+    def finish():
+        statuses = [c["status"] for c in report["checks"]]
+        report["verdict"] = "fail" if "fail" in statuses else "warn" if "warn" in statuses else "ok"
+        return report
+
+    domain = normalize_domain(raw_domain)
+    if not domain:
+        add("domain", "fail", "это не доменное имя (IP-адреса и служебные имена не подходят)")
+        return finish()
+    report["domain"] = domain
+
+    ips = resolve_ipv4(domain)
+    det["ips"] = ips
+    if not ips:
+        add("dns", "fail", "домен не резолвится в IPv4")
+        return finish()
+    non_global = [ip for ip in ips if not ipaddress.ip_address(ip).is_global]
+    if non_global:
+        add("dns", "fail", "домен указывает на непубличный адрес: " + ", ".join(non_global))
+        return finish()
+    add("dns", "pass", "резолвится в " + ", ".join(ips))
+
+    target = ips[0]
+    if server_ip:
+        if server_ip in ips:
+            add("not_self", "fail", "домен указывает на сам этот сервер")
+            return finish()
+        net = ipaddress.ip_network(server_ip + "/24", strict=False)
+        near = [ip for ip in ips if ipaddress.ip_address(ip) in net]
+        if near:
+            target = near[0]
+            add("same_subnet", "pass", f"{target} в одной /24 с сервером {server_ip}")
+        else:
+            add("same_subnet", "warn", f"домен не в /24 сервера {server_ip}")
+    else:
+        add("same_subnet", "warn", "IP сервера не определён, укажите его через --ip")
+    det["checked_ip"] = target
+
+    probes, https = [], []
+    for i in range(tries):
+        if i:
+            time.sleep(1)
+        probes.append(probe_tls(domain, target))
+        https.append(probe_http(domain, target))
+
+    connected = [p for p in probes if p["tcp_ms"] is not None]
+    if len(connected) < tries:
+        add("tcp", "fail", f"порт {SNI_PORT} ответил в {len(connected)} попытках из {tries}")
+        return finish()
+    add("tcp", "pass", f"порт {SNI_PORT} отвечает во всех попытках ({tries})")
+
+    shaken = [p for p in probes if p["version"]]
+    if len(shaken) < tries:
+        err = next((p["error"] for p in probes if p["error"]), "нет ответа")
+        add("tls13", "fail", f"TLS 1.3 прошёл в {len(shaken)} попытках из {tries}: {err}")
+        return finish()
+    det["tls_version"] = shaken[0]["version"]
+    add("tls13", "pass", "TLS 1.3 во всех попытках")
+
+    alpns = {p["alpn"] for p in probes}
+    det["alpn"] = sorted(a or "нет" for a in alpns)
+    if alpns == {"h2"}:
+        add("h2", "pass", "сервер выбирает h2 (ALPN)")
+    else:
+        add("h2", "fail", "сервер не всегда выбирает h2: " + ", ".join(det["alpn"]))
+
+    cert_err = next((p["cert_error"] for p in probes if p["cert_error"]), None)
+    good = next((p["cert"] for p in probes if p["cert"]), None)
+    if cert_err or not good:
+        add("cert", "fail", "сертификат не прошёл проверку: " + (cert_err or "нет данных"))
+    else:
+        det["cert"] = cert_details(good)
+        days = det["cert"]["days_left"]
+        add("cert", "warn" if days < SNI_CERT_MIN_DAYS else "pass",
+            f'сертификат действителен, выдан {det["cert"]["issuer"]}, осталось дней: {days}')
+
+    if any(h is None for h in https):
+        add("http", "warn", "curl не найден, HTTP-ответ не проверен")
+    else:
+        codes = sorted({h[1] for h in https})
+        det["http_status"] = codes
+        det["http_version"] = sorted({h[0] for h in https})
+        if all(c.startswith("2") for c in codes):
+            add("http", "pass", "HTTP-ответ " + ", ".join(codes))
+        elif all(c[0] in "23" for c in codes):
+            add("http", "warn", "сайт отвечает перенаправлением: " + ", ".join(codes))
+        else:
+            err = next((h[2] for h in https if h[2]), "")
+            add("http", "fail", "нет рабочего HTTP-ответа: " + ", ".join(codes)
+                + (f" ({err})" if err else ""))
+
+    rtt = round(statistics.median(p["tcp_ms"] for p in probes), 1)
+    det["tcp_ms"] = rtt
+    add("latency", "warn" if rtt > SNI_MAX_RTT_MS else "pass", f"задержка от сервера {rtt} мс")
+    return finish()
+
+
+def cert_names(cert):
+    """Имена из сертификата: SAN и CN, вместо *.example.com — example.com."""
+    raw = [v for k, v in cert.get("subjectAltName", ()) if k == "DNS"]
+    raw += [v for rdn in cert.get("subject", ()) for k, v in rdn if k == "commonName"]
+    names = []
+    for n in raw:
+        d = normalize_domain(n[2:] if n.startswith("*.") else n)
+        if d and d not in names:
+            names.append(d)
+    return names
+
+
+def scan_host(ip):
+    """Имена с действительного сертификата хоста или None. Без SNI: отдаётся сертификат по умолчанию."""
+    ctx = sni_context()
+    ctx.check_hostname = False  # имя ещё неизвестно, цепочку всё равно проверяем
+    try:
+        with socket.create_connection((ip, SNI_PORT), timeout=SCAN_TIMEOUT) as raw:
+            with ctx.wrap_socket(raw) as s:
+                cert = s.getpeercert()
+    except OSError:
+        return None
+    names = cert_names(cert)
+    return {"ip": ip, "names": names} if names else None
+
+
+def reject_reason(domain):
+    if RE_RDNS.search(domain):
+        return "имя похоже на обратную зону хостера"
+    if RE_VPN.search(domain) or any(RE_NODE.match(label) for label in domain.split(".")[:-2]):
+        return "имя похоже на VPN-ноду"
+    if RE_BRAND.search(domain) or domain.endswith(".mail.ru") or domain == "mail.ru":
+        return "крупный бренд в подсети VPS выглядит подозрительно"
+    if RE_SERVICE.search(domain):
+        return "служебное имя"
+    return None
+
+
+def domain_depth(domain):
+    """Сколько уровней над основным доменом: www не считается."""
+    return max(0, len(domain.removeprefix("www.").split(".")) - 2)
+
+
+def score_candidate(domain, found_ip, check, role):
+    det = check["details"]
+    statuses = {c["id"]: c["status"] for c in check["checks"]}
+    score, reasons = 100, []
+
+    def adj(delta, reason):
+        nonlocal score
+        score += delta
+        reasons.append(f"{delta:+d}: {reason}")
+
+    if found_ip in det.get("ips", []):
+        adj(10, "сертификат найден на том же IP, что в DNS")
+    else:
+        adj(-10, "сертификат найден на другом IP, чем в DNS")
+    rtt = det.get("tcp_ms")
+    if rtt is not None and rtt <= 10:
+        adj(10, f"низкая задержка, {rtt} мс")
+    elif statuses.get("latency") == "warn":
+        adj(-20, f"высокая задержка, {rtt} мс")
+    if statuses.get("http") == "warn":
+        adj(-15, "корень сайта отвечает перенаправлением или HTTP не проверен")
+    if statuses.get("cert") == "warn":
+        adj(-20, "сертификат скоро истекает")
+    is_ru = domain.rsplit(".", 1)[-1] in RU_TLDS
+    if role == "bridge" and is_ru:
+        adj(15, "российский домен для моста в РФ")
+    elif role == "exit" and is_ru:
+        adj(-15, "российский домен на зарубежном выходе")
+    if domain.count("-") >= 2 or sum(ch.isdigit() for ch in domain) >= 3:
+        adj(-10, "имя выглядит не как обычный сайт")
+    if domain_depth(domain) > 0:
+        adj(-10, "поддомен, а не основной сайт")
+    if RE_INFRA.search(domain):
+        adj(-15, "имя похоже на техническое")
+    if RE_RANDOM.search(domain.split(".")[-2]):
+        adj(-20, "имя похоже на случайный набор букв")
+    return score, reasons
+
+
+def sni_scan(server_ip, role=None, top=5, workers=8, max_checks=25, log=lambda m: None):
+    net = ipaddress.ip_network(server_ip + "/24", strict=False)
+    hosts = [str(h) for h in net.hosts() if str(h) != server_ip]
+    log(f"Сканирую {len(hosts)} адресов в {net}, одновременно до {workers} соединений...")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        found = [r for r in pool.map(scan_host, hosts) if r]
+    log(f"Хостов с TLS 1.3 и действительным сертификатом: {len(found)}")
+
+    rejected, pending, seen = [], [], set()
+    for host in found:
+        names = sorted(host["names"], key=lambda n: (n.startswith("www."), len(n)))
+        fresh = [n for n in names if n not in seen]
+        seen.update(fresh)
+        accepted = 0
+        for i, domain in enumerate(fresh):
+            reason = reject_reason(domain)
+            if not reason and i >= SCAN_NAMES_PER_HOST:
+                reason = "слишком много имён в сертификате"
+            if not reason:
+                ips = resolve_ipv4(domain)
+                if not any(ipaddress.ip_address(ip) in net for ip in ips):
+                    reason = "по DNS находится вне /24 сервера"
+            if reason:
+                rejected.append({"domain": domain, "ip": host["ip"], "reason": reason})
+            elif accepted >= SCAN_CHECKS_PER_HOST:
+                rejected.append({"domain": domain, "ip": host["ip"],
+                                 "reason": "на этом хосте уже проверяются другие имена"})
+            else:
+                pending.append((accepted, domain, host["ip"]))
+                accepted += 1
+
+    # Сначала первые имена всех хостов: лимит проверок не должен съесть один хост.
+    # Среди них вперёд основные домены: они лучше подходят и получают более высокую оценку.
+    pending.sort(key=lambda p: (p[0], domain_depth(p[1]) > 0))
+    checked, skipped = pending[:max_checks], pending[max_checks:]
+    for _, domain, ip in skipped:
+        rejected.append({"domain": domain, "ip": ip, "reason": "не хватило лимита проверок (--max-checks)"})
+
+    best = {}
+    for n, (_, domain, ip) in enumerate(checked, 1):
+        log(f"Проверяю {n}/{len(checked)}: {domain}")
+        check = sni_check(domain, server_ip, 2)
+        statuses = {c["id"]: c for c in check["checks"]}
+        failed = next((c for c in check["checks"] if c["status"] == "fail"), None)
+        if failed:
+            rejected.append({"domain": domain, "ip": ip, "reason": failed["message"]})
+        elif statuses.get("same_subnet", {}).get("status") != "pass":
+            rejected.append({"domain": domain, "ip": ip, "reason": "по DNS находится вне /24 сервера"})
+        else:
+            score, reasons = score_candidate(domain, ip, check, role)
+            cand = {"domain": domain, "ip": ip, "score": score, "reasons": reasons, "check": check}
+            # Один лучший домен на IP: иначе список займёт один общий хостинг
+            if ip not in best or score > best[ip]["score"]:
+                best[ip] = cand
+
+    candidates = sorted(best.values(), key=lambda c: (-c["score"], c["domain"]))
+    return {"server_ip": server_ip, "subnet": str(net), "role": role,
+            "hosts_scanned": len(hosts), "hosts_with_tls": len(found),
+            "candidates": candidates[:top], "rejected": rejected}
+
+
+def valid_public_ipv4(ip, opt="--ip"):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        die(f"{opt}: неверный адрес {ip}")
+    if addr.version != 4:
+        die(f"{opt}: нужен IPv4-адрес")
+    return addr
+
+
+def int_opt(opts, name, low, high):
+    v = opts.pop(0)
+    if not v.isdigit() or not low <= int(v) <= high:
+        die(f"{name}: нужно число от {low} до {high}")
+    return int(v)
+
+
+def cmd_sni_scan(opts):
+    as_json, ip, role, top, workers, max_checks = False, None, None, 5, 8, 25
+    while opts:
+        o = opts.pop(0)
+        if o == "--json":
+            as_json = True
+        elif o == "--ip" and opts:
+            ip = opts.pop(0)
+            valid_public_ipv4(ip)
+        elif o == "--role" and opts:
+            role = opts.pop(0)
+            if role not in ("bridge", "exit"):
+                die("--role: используйте bridge или exit")
+        elif o == "--top" and opts:
+            top = int_opt(opts, o, 1, 50)
+        elif o == "--workers" and opts:
+            workers = int_opt(opts, o, 1, 32)
+        elif o == "--max-checks" and opts:
+            max_checks = int_opt(opts, o, 1, 100)
+        else:
+            die(f"неизвестный параметр {o}")
+
+    ip = ip or detect_server_ip()
+    if not ip:
+        die("не удалось определить IP сервера, укажите его через --ip")
+    if not ipaddress.ip_address(ip).is_global:
+        die(f"{ip} — непубличный адрес, укажите внешний IP сервера через --ip")
+
+    def log(m):
+        print(m, file=sys.stderr, flush=True)
+
+    log("Внимание: скан соседних адресов может вызвать жалобу хостеру.")
+    rep = sni_scan(ip, role, top, workers, max_checks, log)
+    if as_json:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    else:
+        for n, c in enumerate(rep["candidates"], 1):
+            print(f'{n}. {c["domain"]} ({c["ip"]}), оценка {c["score"]}')
+            for r in c["reasons"]:
+                print(f"     {r}")
+        print(f'Адресов: {rep["hosts_scanned"]}, с TLS 1.3 и действительным сертификатом: '
+              f'{rep["hosts_with_tls"]}, отброшено имён: {len(rep["rejected"])}.')
+        if rep["candidates"]:
+            print("Перед установкой можно перепроверить: exitctl sni check <домен>")
+        else:
+            print(f'В {rep["subnet"]} подходящих доменов нет. Укажите свой и проверьте его: '
+                  "exitctl sni check <домен>")
+    if not rep["candidates"]:
+        sys.exit(1)
+
+
+def cmd_sni(a):
+    if a and a[0] == "scan":
+        cmd_sni_scan(a[1:])
+        return
+    if len(a) < 2 or a[0] != "check":
+        die("используйте: exitctl sni check <домен> [--ip IP] [--tries N] [--json]\n"
+            "       или: exitctl sni scan [--ip IP] [--role bridge|exit] [--json]")
+    domain, opts = a[1], a[2:]
+    as_json, ip, tries = False, None, 3
+    while opts:
+        o = opts.pop(0)
+        if o == "--json":
+            as_json = True
+        elif o == "--ip" and opts:
+            ip = opts.pop(0)
+            valid_public_ipv4(ip)
+        elif o == "--tries" and opts:
+            t = opts.pop(0)
+            if not t.isdigit() or not 1 <= int(t) <= 10:
+                die("--tries: нужно число от 1 до 10")
+            tries = int(t)
+        else:
+            die(f"неизвестный параметр {o}")
+
+    rep = sni_check(domain, ip or detect_server_ip(), tries)
+    if as_json:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    else:
+        print(f'Домен: {rep["domain"]}   Сервер: {rep["server_ip"] or "не определён"}')
+        marks = {"pass": " OK ", "warn": "WARN", "fail": "FAIL"}
+        for c in rep["checks"]:
+            print(f'[{marks[c["status"]]}] {c["id"]}: {c["message"]}')
+        print("Итог:", {"ok": "подходит", "warn": "подходит, но есть предупреждения",
+                        "fail": "не подходит"}[rep["verdict"]])
+    if rep["verdict"] == "fail":
+        sys.exit(1)
+
+
+def run_text(*cmd):
+    """stdout команды или None, если её нет или она завершилась ошибкой."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def inbound_in(base):
+    for i in base.get("inbounds", []):
+        if i.get("tag") == "in":
+            return i
+    die("в 00_base.json нет inbound с тегом in")
+
+
+def client_name(c):
+    return c.get("email") or c["id"][:8]
+
+
+def public_key(base):
+    priv = inbound_in(base)["streamSettings"]["realitySettings"]["privateKey"]
+    out = run_text(XRAY, "x25519", "-i", priv) or ""
+    m = re.search(r"^(?:public|password)[^:\n]*:\s*(\S+)", out, re.I | re.M)
+    return m.group(1) if m else None
+
+
+def client_link(base, client, host, pub):
+    ib = inbound_in(base)
+    rs = ib["streamSettings"]["realitySettings"]
+    flow = client.get("flow", "")
+    return (f'vless://{client["id"]}@{host}:{ib["port"]}?type=tcp&security=reality'
+            f'&sni={rs["serverNames"][0]}&pbk={pub}&sid={rs["shortIds"][0]}&fp=chrome'
+            + (f"&flow={flow}" if flow else "") + f"#{client_name(client)}")
+
+
+def user_traffic():
+    """{имя: {uplink, downlink}} или None, если счётчики недоступны.
+
+    Пустой ответ — это не ошибка: пока трафика не было, Xray не возвращает ни одного счётчика.
+    Счётчики обнуляются при каждом перезапуске Xray.
+    """
+    out = run_text(XRAY, "api", "statsquery", f"--server={API_SERVER}", "-pattern", "user>>>")
+    if out is None:
+        return None
+    try:
+        stats = json.loads(out or "{}").get("stat") or []
+    except ValueError:
+        return None
+    res = {}
+    for s in stats:
+        parts = s.get("name", "").split(">>>")
+        if len(parts) == 4 and parts[3] in ("uplink", "downlink"):
+            res.setdefault(parts[1], {})[parts[3]] = int(s.get("value", 0))
+    return res
+
+
+def users_report(base, host):
+    host = host or detect_server_ip()
+    pub = public_key(base)
+    traffic = user_traffic()
+    users = []
+    for c in inbound_in(base)["settings"]["clients"]:
+        name = client_name(c)
+        t = traffic.get(name, {}) if traffic is not None else {}
+        known = traffic is not None
+        users.append({"name": name, "uuid": c["id"],
+                      "uplink": t.get("uplink", 0) if known else None,
+                      "downlink": t.get("downlink", 0) if known else None,
+                      "link": client_link(base, c, host, pub) if host and pub else None})
+    return users
+
+
+def cmd_user(a):
+    usage = "используйте: exitctl user list|add <имя>|link <имя>|remove <имя> [--host АДРЕС] [--json]"
+    if not a:
+        die(usage)
+    action, rest, as_json, host, name = a[0], a[1:], False, None, None
+    while rest:
+        o = rest.pop(0)
+        if o == "--json":
+            as_json = True
+        elif o == "--host" and rest:
+            host = rest.pop(0)
+            if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+                die(f"--host: неверный адрес {host}")
+        elif not o.startswith("-") and name is None:
+            name = o
+        else:
+            die(f"неизвестный параметр {o}")
+
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    clients = inbound_in(base)["settings"]["clients"]
+    if action == "list":
+        users = users_report(base, host)
+        if as_json:
+            print(json.dumps(users, ensure_ascii=False, indent=2))
+            return
+        print(f'{"ИМЯ":<24} {"ПРИНЯТО":>14} {"ОТДАНО":>14}')
+        for u in users:
+            print(f'{u["name"]:<24} {str(u["uplink"] if u["uplink"] is not None else "—"):>14} '
+                  f'{str(u["downlink"] if u["downlink"] is not None else "—"):>14}')
+        return
+    if action not in ("add", "link", "remove") or not name:
+        die(usage)
+    clean = clean_name(name)
+    if not clean:
+        die("в имени нужны латинские буквы, цифры, - или _")
+    found = next((c for c in clients if client_name(c) == clean), None)
+
+    if action == "link":
+        if not found:
+            die(f"пользователь «{clean}» не найден")
+        print(next(u["link"] for u in users_report(base, host) if u["name"] == clean)
+              or die("не удалось получить ссылку: укажите --host и проверьте xray"))
+    elif action == "add":
+        if found:
+            die(f"пользователь «{clean}» уже есть")
+        clients.append({"id": str(uuid.uuid4()), "flow": "xtls-rprx-vision", "email": clean})
+        with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
+            apply(base, ex)
+        user = next(u for u in users_report(base, host) if u["name"] == clean)
+        if as_json:
+            print(json.dumps(user, ensure_ascii=False, indent=2))
+        else:
+            print(f"Добавлен пользователь «{clean}».")
+            print(user["link"] or "Ссылку получить не удалось: укажите --host и проверьте xray.")
+    else:
+        if not found:
+            die(f"пользователь «{clean}» не найден")
+        if len(clients) == 1:
+            die("нельзя удалить последнего пользователя: к серверу некому будет подключиться")
+        clients.remove(found)
+        apply(base, ex)
+        print(f"Удалён пользователь «{clean}».")
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def can_connect(host):
+    """Только первый IPv4-адрес: перебор всех адресов на закрытом сервере идёт десятки секунд."""
+    ips = resolve_ipv4(host)
+    if not ips:
+        return False
+    try:
+        with socket.create_connection((ips[0], 443), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
+def egress_report():
+    """Какие внешние адреса доступны с сервера: у части VPS исходящий трафик ограничен."""
+    with ThreadPoolExecutor(max_workers=len(EGRESS_HOSTS)) as pool:
+        return dict(zip(EGRESS_HOSTS, pool.map(can_connect, EGRESS_HOSTS)))
+
+
+def capabilities(egress):
+    """Для чего годится сервер. Выходу и простому режиму нужен открытый зарубежный трафик.
+
+    Мосту его не нужно, но мост должен доставать до своего выхода: это проверяется
+    уже при добавлении выхода, потому что адрес заранее неизвестен.
+    """
+    reachable = sum(1 for h in EGRESS_FOREIGN if egress.get(h))
+    foreign_open = reachable >= len(EGRESS_FOREIGN) - 1
+    return {"exit": foreign_open, "simple": foreign_open,
+            "bridge": foreign_open or bool(egress.get("ya.ru"))}
+
+
+def status_report():
+    meminfo = dict(re.findall(r"^(\w+):\s+(\d+) kB", read_file("/proc/meminfo") or "", re.M))
+    mem_total, mem_avail = meminfo.get("MemTotal"), meminfo.get("MemAvailable")
+    loadavg = (read_file("/proc/loadavg") or "").split()
+    uptime = (read_file("/proc/uptime") or "").split()
+    os_name = re.search(r'^PRETTY_NAME="?([^"\n]*)', read_file("/etc/os-release") or "", re.M)
+    disk = shutil.disk_usage("/")
+    egress = egress_report()
+
+    rep = {
+        "hostname": socket.gethostname(),
+        "os": os_name.group(1) if os_name else None,
+        "uptime_seconds": int(float(uptime[0])) if uptime else None,
+        "load": [float(x) for x in loadavg[:3]],
+        "cpu_count": os.cpu_count(),
+        "memory": {"total": int(mem_total) * 1024, "available": int(mem_avail) * 1024}
+        if mem_total and mem_avail else None,
+        "disk": {"total": disk.total, "free": disk.free},
+        "public_ip": detect_server_ip(),
+        "egress": egress,
+        "capabilities": capabilities(egress),
+        "xray": {
+            "active": run_text("systemctl", "is-active", "xray") == "active",
+            "version": ((run_text(XRAY, "version") or "").splitlines() or [None])[0],
+        },
+        "installed": os.path.exists(BASE),
+        "mode": None, "sni": None, "port": None, "users": None, "exits": None,
+    }
+    if rep["installed"]:
+        base, ex = load(BASE), load(EXITS, {"outbounds": []})
+        ib = inbound_in(base)
+        rep["mode"] = "bridge" if base.get("routing", {}).get("balancers") else "simple"
+        rep["sni"] = ib["streamSettings"]["realitySettings"]["serverNames"][0]
+        rep["port"] = ib["port"]
+        rep["users"] = len(ib["settings"]["clients"])
+        rep["exits"] = len(exits_list(ex))
+    elif os.path.exists(EXIT_CONF):
+        # Выход настроен exit-setup.sh: один config.json. Установщик Xray кладёт сюда пустой {}.
+        try:
+            with open(EXIT_CONF) as f:
+                inbounds = json.load(f).get("inbounds") or []
+            rs = inbounds[0]["streamSettings"]["realitySettings"] if inbounds else None
+        except (OSError, ValueError, KeyError, AttributeError):
+            rs = None
+        if rs:
+            rep.update(installed=True, mode="exit", sni=rs["serverNames"][0], port=inbounds[0]["port"])
+    return rep
+
+
+def cmd_status(a):
+    if a not in ([], ["--json"]):
+        die("используйте: exitctl status [--json]")
+    rep = status_report()
+    if a:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+        return
+    print("Сервер:", rep["hostname"], rep["public_ip"] or "")
+    print("Система:", rep["os"] or "неизвестно")
+    print("Xray:", "работает" if rep["xray"]["active"] else "не работает", rep["xray"]["version"] or "")
+    blocked = [h for h, ok in rep["egress"].items() if not ok]
+    print("Исходящий доступ:", "нет связи с " + ", ".join(blocked) if blocked else "в порядке")
+    names = {"exit": "выход", "simple": "простой режим", "bridge": "мост"}
+    roles = [names[k] for k, ok in rep["capabilities"].items() if ok]
+    print("Годится как:", ", ".join(roles) or "ничего из вариантов")
+    if rep["installed"] and rep["mode"] == "exit":
+        print(f'Режим: exit, SNI: {rep["sni"]}, порт: {rep["port"]}')
+    elif rep["installed"]:
+        print(f'Режим: {rep["mode"]}, SNI: {rep["sni"]}, порт: {rep["port"]}, '
+              f'пользователей: {rep["users"]}, выходов: {rep["exits"]}')
+    else:
+        print("Xray через эти скрипты не настроен.")
+
+
+def main(a):
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    c = a[0]
+    if c == "list":
+        cmd_list("--json" in a[1:])
+    elif c == "add" and len(a) in (2, 3):
+        cmd_add(a[1], a[2] if len(a) == 3 else None)
+    elif c in ("remove", "rm", "del") and len(a) == 2:
+        cmd_remove(a[1])
+    elif c == "use" and len(a) == 2:
+        cmd_use(a[1])
+    elif c == "auto":
+        cmd_auto()
+    elif c == "check":
+        cmd_check("--json" in a[1:])
+    elif c == "direct" and len(a) >= 2:
+        cmd_direct(a[1], a[2] if len(a) > 2 else None)
+    elif c == "sni":
+        cmd_sni(a[1:])
+    elif c == "user":
+        cmd_user(a[1:])
+    elif c == "status":
+        cmd_status(a[1:])
+    else:
+        print(__doc__.strip())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

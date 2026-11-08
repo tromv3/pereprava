@@ -1,0 +1,6 @@
+# Скрипты выполняются на Linux: только LF, независимо от настроек git на Windows.
+* text=auto eol=lf
+*.exe binary
+*.png binary
+*.ico binary
+*.woff2 binary
