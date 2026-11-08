@@ -92,7 +92,7 @@ function formatUptime(s) {
 
 function renderSide() {
   return h('aside', { class: 'side' },
-    h('h1', {}, 'VLESS Bridge'),
+    h('h1', {}, 'Переправа'),
     state.servers.map((s) => h('button', {
       class: `server-item${state.selected === s.id && state.view === 'server' ? ' active' : ''}`,
       onclick: () => openServer(s.id),

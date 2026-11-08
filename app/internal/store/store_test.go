@@ -28,6 +28,42 @@ func TestEncryptRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDefaultDirMigratesOldName(t *testing.T) {
+	base := t.TempDir()
+	old := filepath.Join(base, "vless-bridge")
+	os.MkdirAll(old, 0o700)
+	os.WriteFile(filepath.Join(old, "servers.json"), []byte(`[{"id":"a"}]`), 0o600)
+
+	dir := defaultDir(base)
+	if filepath.Base(dir) != "pereprava" {
+		t.Fatalf("каталог: %s", dir)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "servers.json"))
+	if err != nil || string(data) != `[{"id":"a"}]` {
+		t.Fatalf("старые данные не перенесены: %q %v", data, err)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatal("старый каталог должен исчезнуть после переноса")
+	}
+
+	// Если новый каталог уже есть, старый не трогаем.
+	os.MkdirAll(old, 0o700)
+	os.WriteFile(filepath.Join(old, "servers.json"), []byte(`[]`), 0o600)
+	defaultDir(base)
+	if data, _ := os.ReadFile(filepath.Join(dir, "servers.json")); string(data) != `[{"id":"a"}]` {
+		t.Fatalf("новые данные перезаписаны: %q", data)
+	}
+	if _, err := os.Stat(old); err != nil {
+		t.Fatal("старый каталог не должен удаляться, если новый уже есть")
+	}
+
+	// Чистая установка: создаётся только новое имя.
+	fresh := t.TempDir()
+	if filepath.Base(defaultDir(fresh)) != "pereprava" {
+		t.Fatal("новое имя каталога")
+	}
+}
+
 func TestStoreCRUD(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)

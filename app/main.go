@@ -14,7 +14,7 @@ var assets embed.FS
 func main() {
 	app := NewApp()
 	err := wails.Run(&options.App{
-		Title:     "VLESS Bridge",
+		Title:     "Переправа",
 		Width:     1100,
 		Height:    760,
 		MinWidth:  820,

@@ -33,14 +33,33 @@ type Store struct {
 	path string
 }
 
-// Open использует каталог dir или, если он пуст, %APPDATA%\vless-bridge.
+// Каталог данных в %APPDATA%. До переименования приложения он назывался vless-bridge.
+const (
+	dirName    = "pereprava"
+	oldDirName = "vless-bridge"
+)
+
+// defaultDir возвращает каталог данных внутри base и переносит туда старый, если новый ещё не создан.
+// Секреты зашифрованы DPAPI ключом пользователя, а не путём файла, поэтому перенос их не ломает.
+func defaultDir(base string) string {
+	dir := filepath.Join(base, dirName)
+	old := filepath.Join(base, oldDirName)
+	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(old); err == nil {
+			_ = os.Rename(old, dir)
+		}
+	}
+	return dir
+}
+
+// Open использует каталог dir или, если он пуст, %APPDATA%\pereprava.
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		base, err := os.UserConfigDir()
 		if err != nil {
 			return nil, err
 		}
-		dir = filepath.Join(base, "vless-bridge")
+		dir = defaultDir(base)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
