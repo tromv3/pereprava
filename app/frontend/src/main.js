@@ -1,8 +1,8 @@
 import './style.css';
 import {
-  AddDirect, AddExit, AddUser, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Install, ListExits,
+  AddDirect, AddExit, AddUser, AllowBridgeOnExit, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Install, ListExits,
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
-  ListDirect, RemoveDirect, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
+  ListDirect, MigrateUsers, RemoveDirect, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn } from '../wailsjs/runtime/runtime';
 
@@ -255,8 +255,8 @@ function egressWarning(st) {
 function renderServerBody(body, server, st) {
   const panels = !st.installed ? [installPanel(server, st)]
     : st.mode === 'exit' ? [exitInfoPanel(server)]
-      : st.mode === 'bridge' ? [exitsPanel(server), usersPanel(server, st), directPanel(server)]
-        : [usersPanel(server, st)];
+      : st.mode === 'bridge' ? [exitsPanel(server), usersPanel(server, st), directPanel(server), migratePanel(server, st)]
+        : [usersPanel(server, st), migratePanel(server, st)];
   if (st.installed) panels.push(maintenancePanel(server, st));
   body.replaceChildren(...[egressWarning(st), statusPanel(st), ...panels].filter(Boolean));
 }
@@ -322,6 +322,57 @@ function maintenancePanel(server, st) {
     toolOutdated && h('p', { class: 'hint', style: 'margin-bottom:8px' },
       'На сервере старая версия exitctl. Приложению она не мешает, но в консоли сервера будут старые команды.'),
     h('div', { class: 'row' }, buttons), log);
+}
+
+function migratePanel(server, st) {
+  const errorBox = h('div');
+  const result = h('div');
+  const target = h('select', { style: 'width:auto' }, h('option', { value: '' }, 'Куда перенести...'),
+    state.servers.filter((s) => s.id !== server.id).map((s) => h('option', { value: s.id }, s.name)));
+  const keys = h('input', { type: 'checkbox', style: 'width:auto;margin-right:6px' });
+  const btn = h('button', {}, 'Перенести');
+  const what = st.mode === 'bridge' ? 'пользователи, выходы и сайты напрямую' : 'пользователи';
+
+  btn.addEventListener('click', async () => {
+    const dst = state.servers.find((s) => s.id === target.value);
+    if (!dst) {
+      errorBox.replaceChildren(h('div', { class: 'error' }, 'Выберите сервер, куда переносить.'));
+      return;
+    }
+    const keysText = keys.checked
+      ? ` Ключи Reality на «${dst.name}» заменятся ключами этого сервера: ссылки, уже выданные на «${dst.name}», перестанут работать.`
+      : '';
+    const ok = await confirmDialog(`Перенести на «${dst.name}»?`,
+      `На «${dst.name}» добавятся ${what} этого сервера; у пользователей сохранятся их ключи (UUID). Пользователи с уже занятым именем пропускаются. Xray на «${dst.name}» перезапустится.${keysText}`,
+      'Перенести');
+    if (!ok) return;
+    errorBox.replaceChildren();
+    result.replaceChildren(h('p', { class: 'hint' }, 'Переношу...'));
+    btn.disabled = true;
+    try {
+      const rep = await withHost(dst.id, () => MigrateUsers(server.id, dst.id, keys.checked));
+      const changed = rep.keys ? 'адрес и SNI' : 'адрес, SNI и ключи Reality (pbk, sid)';
+      result.replaceChildren(h('div', { class: 'panel', style: 'margin:10px 0 0' },
+        h('p', {}, `Добавлены: ${rep.added.join(', ') || 'никто'}.`),
+        rep.skipped.length ? h('p', {}, `Пропущены, такое имя или UUID уже есть: ${rep.skipped.join(', ')}.`) : null,
+        rep.exits_added.length || rep.direct_added ? h('p', {}, `Выходов добавлено: ${rep.exits_added.join(', ') || 'нет'}; сайтов напрямую: ${rep.direct_added}.`) : null,
+        rep.ignored.map((t) => h('p', { class: 'hint' }, `Не перенесено: ${t}.`)),
+        h('p', { class: 'hint' }, `Новые ссылки — в списке пользователей «${dst.name}»: в них изменились ${changed}. Раздайте их пользователям.`)));
+    } catch (e) {
+      result.replaceChildren();
+      errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  return h('div', { class: 'panel' }, h('h3', {}, 'Перенос на другой сервер'), errorBox,
+    h('p', { class: 'hint', style: 'margin-bottom:8px' },
+      `Если этот сервер нужно заменить: на новый, уже настроенный сервер переедут ${what}. Этот сервер не изменится.`),
+    h('div', { class: 'row', style: 'margin-bottom:8px' }, target, btn),
+    h('label', { style: 'cursor:pointer' }, keys,
+      'Перенести и ключи Reality, чтобы pbk и sid в ссылках не изменились'),
+    result);
 }
 
 function directPanel(server) {
@@ -407,9 +458,21 @@ function exitsPanel(server) {
       return;
     }
     const dead = exits.filter((x) => !health[x.name]?.ok).map((x) => x.name);
+    // Выход из списка серверов, до которого мост не достаёт: возможно, его файрвол не знает этот мост.
+    const allowButtons = exits.filter((x) => !health[x.name]?.ok).map((x) => {
+      const exitServer = state.servers.find((s) => s.host === x.address && s.id !== server.id);
+      if (!exitServer) return null;
+      return h('button', {
+        onclick: async (e) => {
+          e.target.disabled = true;
+          await act(() => withHost(exitServer.id, () => AllowBridgeOnExit(exitServer.id, server.id)));
+        },
+      }, `Разрешить этот мост на выходе «${exitServer.name}»`);
+    }).filter(Boolean);
     // replaceChildren превращает null в текст «null», поэтому пустые элементы отфильтровываются.
     list.replaceChildren(...[
-      dead.length ? h('div', { class: 'notice' }, `Мост не достаёт до: ${dead.join(', ')}. Проверьте адрес выхода и то, что при его установке указан IP этого моста. Если выход настроен верно, значит соединения режет хостер одного из серверов, и нужен выход в другой сети.`) : null,
+      dead.length ? h('div', { class: 'notice' }, `Мост не достаёт до: ${dead.join(', ')}. Проверьте адрес выхода и то, что файрвол выхода пускает этот мост (при установке выхода указывается IP моста). Если выход настроен верно, значит соединения режет хостер одного из серверов, и нужен выход в другой сети.`) : null,
+      allowButtons.length ? h('div', { class: 'row', style: 'margin-bottom:10px' }, allowButtons) : null,
       h('p', { class: 'hint', style: 'margin-bottom:8px' }, data.pinned ? `Весь трафик идёт через «${data.pinned}».` : 'Автовыбор: самый быстрый живой выход.'),
       h('table', {},
         h('thead', {}, h('tr', {}, ['Имя', 'Адрес', 'Связь с моста', ''].map((t) => h('th', {}, t)))),

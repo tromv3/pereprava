@@ -14,6 +14,10 @@ export function AddUser(arg1, arg2) {
   return window['go']['main']['App']['AddUser'](arg1, arg2);
 }
 
+export function AllowBridgeOnExit(arg1, arg2) {
+  return window['go']['main']['App']['AllowBridgeOnExit'](arg1, arg2);
+}
+
 export function AutoExit(arg1) {
   return window['go']['main']['App']['AutoExit'](arg1);
 }
@@ -56,6 +60,10 @@ export function ListServers() {
 
 export function ListUsers(arg1) {
   return window['go']['main']['App']['ListUsers'](arg1);
+}
+
+export function MigrateUsers(arg1, arg2, arg3) {
+  return window['go']['main']['App']['MigrateUsers'](arg1, arg2, arg3);
 }
 
 export function QRCode(arg1) {

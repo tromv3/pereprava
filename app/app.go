@@ -413,6 +413,64 @@ func (a *App) UpdateXray(id string) error {
 	return a.runScript(c, "update-xray.sh", " "+remote.Quote(dir), "обновление Xray не удалось")
 }
 
+// MigrateUsers переносит пользователей (на мосту — ещё выходы и сайты напрямую) с srcID на dstID.
+// Секреты идут через память и временный файл с правами 600 на целевом сервере, который сразу удаляется.
+func (a *App) MigrateUsers(srcID, dstID string, keepKeys bool) (any, error) {
+	if srcID == dstID {
+		return nil, errors.New("выберите другой сервер")
+	}
+	exported, err := a.tool(srcID, false, "migrate", "export")
+	if err != nil {
+		return nil, err
+	}
+	payload, err := json.Marshal(exported)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.ensurePython(dstID); err != nil {
+		return nil, err
+	}
+	c, err := a.connect(dstID)
+	if err != nil {
+		return nil, err
+	}
+	path := c.dir + "/migrate.json"
+	if err := c.client.Upload(a.ctx, path, payload, "600"); err != nil {
+		return nil, err
+	}
+	defer c.client.Run(a.ctx, "rm -f "+remote.Quote(path), false, nil)
+	args := []string{"migrate", "import", path, "--json"}
+	if keepKeys {
+		args = append(args, "--keys")
+	}
+	return a.tool(dstID, false, args...)
+}
+
+// AllowBridgeOnExit открывает порт 443 выхода exitID для адреса моста bridgeID.
+func (a *App) AllowBridgeOnExit(exitID, bridgeID string) error {
+	bridge, err := a.store.Get(bridgeID)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(bridge.Host)
+	if ip == nil || ip.To4() == nil {
+		return errors.New("у моста в настройках указан не IPv4-адрес: разрешите его на выходе вручную")
+	}
+	c, err := a.connect(exitID)
+	if err != nil {
+		return err
+	}
+	cmd := "ufw allow from " + ip.String() + " to any port 443 proto tcp"
+	r, err := c.client.Run(a.ctx, cmd, true, nil)
+	if err != nil {
+		return err
+	}
+	if r.Code != 0 {
+		return commandError(r)
+	}
+	return nil
+}
+
 // ListDirect возвращает свои домены, которые мост открывает напрямую.
 func (a *App) ListDirect(id string) (any, error) { return a.tool(id, false, "direct", "list", "--json") }
 

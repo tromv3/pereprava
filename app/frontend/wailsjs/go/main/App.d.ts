@@ -8,6 +8,8 @@ export function AddExit(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function AddUser(arg1:string,arg2:string):Promise<any>;
 
+export function AllowBridgeOnExit(arg1:string,arg2:string):Promise<void>;
+
 export function AutoExit(arg1:string):Promise<void>;
 
 export function CheckExits(arg1:string):Promise<any>;
@@ -29,6 +31,8 @@ export function ListExits(arg1:string):Promise<any>;
 export function ListServers():Promise<Array<main.ServerView>>;
 
 export function ListUsers(arg1:string):Promise<any>;
+
+export function MigrateUsers(arg1:string,arg2:string,arg3:boolean):Promise<any>;
 
 export function QRCode(arg1:string):Promise<string>;
 

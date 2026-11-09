@@ -20,6 +20,8 @@
   exitctl user remove <имя>                        удалить пользователя
   exitctl status [--json]                          состояние сервера и Xray
   exitctl reach <адрес> <порт> [--json]            достаёт ли этот сервер до адреса (код 1 — нет)
+  exitctl migrate export                           пользователи, ключи Reality, выходы и сайты напрямую (JSON)
+  exitctl migrate import <файл> [--keys] [--json]  добавить их сюда; --keys заменяет ключи Reality
 """
 import contextlib, ipaddress, json, os, re, shutil, socket, ssl, statistics, subprocess, sys, tempfile, time, uuid
 import hashlib
@@ -1185,6 +1187,119 @@ def cmd_reach(a):
         sys.exit(1)
 
 
+MIGRATE_VERSION = 1
+
+
+def migrate_export():
+    """Всё, что нужно перенести на другой мост. Содержит секреты: выводится только в stdout."""
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    ib = inbound_in(base)
+    rs = ib["streamSettings"]["realitySettings"]
+    r = find_rule(base, RULE_DIRECT)
+    return {
+        "version": MIGRATE_VERSION,
+        "mode": "bridge" if base.get("routing", {}).get("balancers") else "simple",
+        "clients": [{"id": c["id"], "email": client_name(c), "flow": c.get("flow", "")}
+                    for c in ib["settings"]["clients"]],
+        "reality": {"privateKey": rs["privateKey"], "shortIds": rs["shortIds"]},
+        "direct": list(r["domain"]) if r else [],
+        "exits": exits_list(ex),
+    }
+
+
+def migrate_import(data, keys):
+    """Добавить пользователей (и на мосту — выходы и сайты напрямую). Существующее не трогается.
+
+    Пользователь пропускается, если такое имя или UUID уже есть: иначе две разные ссылки
+    давали бы одно имя в счётчиках или один UUID — двум людям.
+    """
+    if not isinstance(data, dict) or data.get("version") != MIGRATE_VERSION:
+        die("файл переноса не той версии или повреждён")
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    ib = inbound_in(base)
+    clients = ib["settings"]["clients"]
+    names = {client_name(c) for c in clients}
+    ids = {c["id"] for c in clients}
+    rep = {"added": [], "skipped": [], "keys": False, "direct_added": 0, "exits_added": [], "ignored": []}
+
+    for c in data.get("clients", []):
+        name = clean_name(c.get("email", "")) or c["id"][:8]
+        if name in names or c["id"] in ids:
+            rep["skipped"].append(name)
+            continue
+        clients.append({"id": c["id"], "flow": c.get("flow") or "xtls-rprx-vision", "email": name})
+        names.add(name)
+        ids.add(c["id"])
+        rep["added"].append(name)
+
+    if keys:
+        rs = ib["streamSettings"]["realitySettings"]
+        rs["privateKey"] = data["reality"]["privateKey"]
+        rs["shortIds"] = list(data["reality"]["shortIds"])
+        rep["keys"] = True
+
+    is_bridge = bool(base.get("routing", {}).get("balancers"))
+    if is_bridge:
+        rules = base["routing"]["rules"]
+        r = find_rule(base, RULE_DIRECT)
+        doms = list(r["domain"]) if r else []
+        for d in data.get("direct", []):
+            if d not in doms:
+                doms.append(d)
+                rep["direct_added"] += 1
+        if rep["direct_added"]:
+            if r:
+                rules.remove(r)
+            rules.insert(0, {"ruleTag": RULE_DIRECT, "domain": doms, "outboundTag": "direct"})
+        tags = {o.get("tag") for o in ex.get("outbounds", [])}
+        for o in data.get("exits", []):
+            if o.get("tag", "").startswith(PREFIX) and o["tag"] not in tags:
+                ex.setdefault("outbounds", []).append(o)
+                rep["exits_added"].append(o["tag"][len(PREFIX):])
+        if rep["exits_added"]:
+            sync_fallback(base, ex)
+    else:
+        if data.get("direct"):
+            rep["ignored"].append("сайты напрямую: на простом сервере всё и так идёт напрямую")
+        if data.get("exits"):
+            rep["ignored"].append("выходы: простой сервер выходы не использует")
+
+    if rep["added"] or rep["keys"] or rep["direct_added"] or rep["exits_added"]:
+        apply(base, ex)
+    return rep
+
+
+def cmd_migrate(a):
+    if a[:1] == ["export"] and len(a) == 1:
+        print(json.dumps(migrate_export(), ensure_ascii=False))
+        return
+    if a[:1] != ["import"] or len(a) < 2:
+        die("используйте: exitctl migrate export | exitctl migrate import <файл> [--keys] [--json]")
+    path, opts = a[1], a[2:]
+    if any(o not in ("--keys", "--json") for o in opts):
+        die("неизвестный параметр: " + " ".join(o for o in opts if o not in ("--keys", "--json")))
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        die(f"не удалось прочитать файл переноса: {e}")
+    as_json = "--json" in opts
+    with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
+        rep = migrate_import(data, "--keys" in opts)
+    if as_json:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+        return
+    print("Добавлены:", ", ".join(rep["added"]) or "никто")
+    if rep["skipped"]:
+        print("Пропущены (такое имя или UUID уже есть):", ", ".join(rep["skipped"]))
+    if rep["keys"]:
+        print("Ключи Reality заменены: прежние ссылки этого сервера больше не работают.")
+    if rep["direct_added"] or rep["exits_added"]:
+        print(f'Сайтов напрямую добавлено: {rep["direct_added"]}, выходов: {", ".join(rep["exits_added"]) or "нет"}')
+    for note in rep["ignored"]:
+        print("Не перенесено —", note)
+
+
 def main(a):
     if not a or a[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
@@ -1213,6 +1328,8 @@ def main(a):
         cmd_status(a[1:])
     elif c == "reach":
         cmd_reach(a[1:])
+    elif c == "migrate":
+        cmd_migrate(a[1:])
     else:
         print(__doc__.strip())
         sys.exit(1)
