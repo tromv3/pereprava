@@ -8,18 +8,22 @@ jobs:
   scripts:
     name: Серверные скрипты (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    # Python берётся из официального образа, а не из раннера: у новых Ubuntu-раннеров
+    # нет старых версий, а 3.9 — минимальная для exitctl (Python в Debian 11).
+    container: python:${{ matrix.python }}-slim
     strategy:
+      fail-fast: false
       matrix:
-        # 3.9 — минимальная версия для exitctl (str.removeprefix)
         python: ["3.9", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
+      - uses: actions/checkout@v5
+      - name: openssl для тестов SNI
+        run: apt-get update -qq && apt-get install -y -qq openssl >/dev/null
       - name: Синтаксис bash
+        shell: bash
         run: for f in *.sh; do bash -n "$f"; done
       - name: Только LF в скриптах
+        shell: bash
         run: |
           if grep -lI $'\r' exitctl *.sh; then echo "В этих файлах есть CR"; exit 1; fi
       - name: Тесты exitctl
@@ -32,8 +36,8 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: app/go.mod
       - name: Заглушка собранного интерфейса для go:embed
