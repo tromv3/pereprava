@@ -9,15 +9,18 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"vless-bridge/internal/backup"
 	"vless-bridge/internal/bundle"
 	"vless-bridge/internal/remote"
 	"vless-bridge/internal/store"
@@ -427,6 +430,11 @@ func (a *App) MigrateUsers(srcID, dstID string, keepKeys bool) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return a.importPayload(dstID, payload, keepKeys)
+}
+
+// importPayload ставит на dstID данные из migrate export: при переносе и при восстановлении копии.
+func (a *App) importPayload(dstID string, payload []byte, keepKeys bool) (any, error) {
 	if err := a.ensurePython(dstID); err != nil {
 		return nil, err
 	}
@@ -444,6 +452,75 @@ func (a *App) MigrateUsers(srcID, dstID string, keepKeys bool) (any, error) {
 		args = append(args, "--keys")
 	}
 	return a.tool(dstID, false, args...)
+}
+
+// ChooseBackupSave спрашивает, куда сохранить копию. Пустая строка — пользователь отменил.
+func (a *App) ChooseBackupSave(serverName string) (string, error) {
+	name := strings.Map(func(r rune) rune {
+		if strings.ContainsRune(`\/:*?"<>|`, r) {
+			return '-'
+		}
+		return r
+	}, serverName)
+	return runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:           "Сохранить резервную копию сервера",
+		DefaultFilename: fmt.Sprintf("%s %s.pereprava", name, time.Now().Format("2006-01-02")),
+		Filters:         []runtime.FileFilter{{DisplayName: "Копия «Переправы» (*.pereprava)", Pattern: "*.pereprava"}},
+	})
+}
+
+// ChooseBackupOpen спрашивает, какую копию восстановить. Пустая строка — пользователь отменил.
+func (a *App) ChooseBackupOpen() (string, error) {
+	return runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title:   "Восстановить сервер из копии",
+		Filters: []runtime.FileFilter{{DisplayName: "Копия «Переправы» (*.pereprava)", Pattern: "*.pereprava"}},
+	})
+}
+
+// BackupServer сохраняет пользователей, ключи Reality, выходы и сайты напрямую в файл с паролем.
+func (a *App) BackupServer(id, path, password string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("не выбран файл копии")
+	}
+	srv, err := a.store.Get(id)
+	if err != nil {
+		return err
+	}
+	exported, err := a.tool(id, false, "migrate", "export")
+	if err != nil {
+		return err
+	}
+	plain, err := json.Marshal(exported)
+	if err != nil {
+		return err
+	}
+	content, err := backup.Seal(plain, password, srv.Name, srv.Host)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, content, 0o600)
+}
+
+// InspectBackup показывает, с какого сервера и когда сделана копия, без пароля.
+func (a *App) InspectBackup(path string) (backup.Header, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return backup.Header{}, err
+	}
+	return backup.Inspect(content)
+}
+
+// RestoreBackup ставит на сервер id данные из копии, как перенос: занятые имена и UUID пропускаются.
+func (a *App) RestoreBackup(id, path, password string, keepKeys bool) (any, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	_, plain, err := backup.Open(content, password)
+	if err != nil {
+		return nil, err
+	}
+	return a.importPayload(id, plain, keepKeys)
 }
 
 // AllowBridgeOnExit открывает порт 443 выхода exitID для адреса моста bridgeID.

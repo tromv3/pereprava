@@ -1,0 +1,43 @@
+name: Тесты
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scripts:
+    name: Серверные скрипты (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.9 — минимальная версия для exitctl (str.removeprefix)
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Синтаксис bash
+        run: for f in *.sh; do bash -n "$f"; done
+      - name: Только LF в скриптах
+        run: |
+          if grep -lI $'\r' exitctl *.sh; then echo "В этих файлах есть CR"; exit 1; fi
+      - name: Тесты exitctl
+        run: python tests/run_all.py
+
+  app:
+    name: Приложение (Go, Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+      - name: Заглушка собранного интерфейса для go:embed
+        shell: bash
+        run: mkdir -p frontend/dist && echo '<!doctype html>' > frontend/dist/index.html
+      - run: go vet ./...
+      - run: go test ./... -count=1

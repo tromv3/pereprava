@@ -22,6 +22,10 @@ export function AutoExit(arg1) {
   return window['go']['main']['App']['AutoExit'](arg1);
 }
 
+export function BackupServer(arg1, arg2, arg3) {
+  return window['go']['main']['App']['BackupServer'](arg1, arg2, arg3);
+}
+
 export function CheckExits(arg1) {
   return window['go']['main']['App']['CheckExits'](arg1);
 }
@@ -34,12 +38,24 @@ export function CheckSNI(arg1, arg2) {
   return window['go']['main']['App']['CheckSNI'](arg1, arg2);
 }
 
+export function ChooseBackupOpen() {
+  return window['go']['main']['App']['ChooseBackupOpen']();
+}
+
+export function ChooseBackupSave(arg1) {
+  return window['go']['main']['App']['ChooseBackupSave'](arg1);
+}
+
 export function DeleteServer(arg1) {
   return window['go']['main']['App']['DeleteServer'](arg1);
 }
 
 export function ExitLink(arg1) {
   return window['go']['main']['App']['ExitLink'](arg1);
+}
+
+export function InspectBackup(arg1) {
+  return window['go']['main']['App']['InspectBackup'](arg1);
 }
 
 export function Install(arg1, arg2, arg3, arg4) {
@@ -80,6 +96,10 @@ export function RemoveExit(arg1, arg2) {
 
 export function RemoveUser(arg1, arg2) {
   return window['go']['main']['App']['RemoveUser'](arg1, arg2);
+}
+
+export function RestoreBackup(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['RestoreBackup'](arg1, arg2, arg3, arg4);
 }
 
 export function SaveServer(arg1) {

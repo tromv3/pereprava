@@ -1,8 +1,8 @@
 import './style.css';
 import {
-  AddDirect, AddExit, AddUser, AllowBridgeOnExit, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Install, ListExits,
+  AddDirect, AddExit, AddUser, AllowBridgeOnExit, BackupServer, ChooseBackupOpen, ChooseBackupSave, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Install, ListExits,
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
-  ListDirect, MigrateUsers, RemoveDirect, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
+  InspectBackup, ListDirect, MigrateUsers, RemoveDirect, RestoreBackup, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn } from '../wailsjs/runtime/runtime';
 
@@ -46,6 +46,23 @@ function confirmDialog(title, text, okLabel = 'Продолжить', extra = nu
 }
 
 const msg = (e) => String(e && e.message ? e.message : e);
+
+function passwordDialog(title, text, confirm, extra = null) {
+  return modal((close) => {
+    const pw = h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'пароль' });
+    const pw2 = confirm ? h('input', { type: 'password', autocomplete: 'new-password', placeholder: 'ещё раз', style: 'margin-top:6px' }) : null;
+    const err = h('p', { class: 'fail', style: 'min-height:1.2em;margin:6px 0 0' });
+    const ok = () => {
+      if (pw.value.length < 8) { err.textContent = 'Пароль должен быть не короче 8 символов.'; return; }
+      if (confirm && pw.value !== pw2.value) { err.textContent = 'Пароли не совпадают.'; return; }
+      close(pw.value);
+    };
+    return [h('h3', {}, title), h('p', {}, text), pw, pw2, extra, err,
+      h('div', { class: 'modal-actions' },
+        h('button', { onclick: () => close(null) }, 'Отмена'),
+        h('button', { class: 'primary', onclick: ok }, 'Продолжить'))];
+  });
+}
 
 // Подтверждение ключа сервера при первом подключении, затем повтор действия.
 async function withHost(id, action) {
@@ -310,10 +327,50 @@ function maintenancePanel(server, st) {
   const toolBtn = h('button', {}, 'Обновить exitctl на сервере');
   toolBtn.addEventListener('click', () => run(toolBtn, () => UpdateTool(server.id), () => openServer(server.id)));
 
+  // Копия нужна мосту и простому серверу: на выходе нет пользователей.
+  const saveBtn = h('button', {}, 'Сохранить копию…');
+  saveBtn.addEventListener('click', async () => {
+    const pw = await passwordDialog('Пароль для копии',
+      'В копии будут пользователи, ключи Reality, выходы и сайты напрямую. Без пароля копию не открыть — запишите его отдельно. Не короче 8 символов.', true);
+    if (!pw) return;
+    const path = await ChooseBackupSave(server.name);
+    if (!path) return;
+    run(saveBtn, () => BackupServer(server.id, path, pw), () => { log.textContent += `Копия сохранена: ${path}\n`; });
+  });
+  const restoreBtn = h('button', {}, 'Восстановить из копии…');
+  restoreBtn.addEventListener('click', async () => {
+    errorBox.replaceChildren();
+    let path;
+    let info;
+    try {
+      path = await ChooseBackupOpen();
+      if (!path) return;
+      info = await InspectBackup(path);
+    } catch (e) {
+      errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+      return;
+    }
+    const keys = h('input', { type: 'checkbox', checked: true, style: 'width:auto;margin-right:6px' });
+    const pw = await passwordDialog('Восстановить из копии?',
+      `Копия сервера «${info.server}» (${info.host}) от ${new Date(info.created).toLocaleString('ru-RU')}. На этот сервер добавятся её пользователи со своими ключами (UUID)${st.mode === 'bridge' ? ', выходы и сайты напрямую' : ''}; занятые имена пропускаются. Xray перезапустится.`,
+      false, h('label', { style: 'cursor:pointer;display:block;margin-top:8px' }, keys,
+        'Восстановить и ключи Reality: pbk и sid в ссылках будут как раньше, но ссылки, уже выданные на этом сервере, перестанут работать'));
+    if (!pw) return;
+    run(restoreBtn, async () => {
+      const rep = await RestoreBackup(server.id, path, pw, keys.checked);
+      log.textContent += `Добавлены: ${rep.added.join(', ') || 'никто'}.\n`;
+      if (rep.skipped.length) log.textContent += `Пропущены, такое имя или UUID уже есть: ${rep.skipped.join(', ')}.\n`;
+      if (rep.exits_added.length || rep.direct_added) log.textContent += `Выходов: ${rep.exits_added.join(', ') || 'нет'}; сайтов напрямую: ${rep.direct_added}.\n`;
+      rep.ignored.forEach((t) => { log.textContent += `Не восстановлено: ${t}.\n`; });
+      log.textContent += `Ключи Reality ${rep.keys ? 'восстановлены' : 'не менялись'}. Новые ссылки — в списке пользователей после «Обновить».\n`;
+    }, () => {});
+  });
+
   // Списки сайтов нужны мосту и простому режиму: выход маршрутизацию по ним не делает.
   if (st.mode !== 'exit') buttons.push(geoBtn);
   buttons.push(xrayBtn);
   if (toolOutdated) buttons.push(toolBtn);
+  if (st.mode !== 'exit') buttons.push(saveBtn, restoreBtn);
   buttons.push(uninstallBtn);
 
   return h('div', { class: 'panel' }, h('h3', {}, 'Обслуживание'), errorBox,
