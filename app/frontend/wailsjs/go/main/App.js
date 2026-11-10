@@ -54,6 +54,10 @@ export function ExitLink(arg1) {
   return window['go']['main']['App']['ExitLink'](arg1);
 }
 
+export function Health(arg1) {
+  return window['go']['main']['App']['Health'](arg1);
+}
+
 export function InspectBackup(arg1) {
   return window['go']['main']['App']['InspectBackup'](arg1);
 }

@@ -356,6 +356,82 @@ c, o, e = cli("add", link("de4"))
 expect("провал проверки выходов: откат, ни API, ни перезапуска", c == 1 and not api_calls and not restarts and open(exits_path).read() == before, (o, e))
 mode["test_rc"] = 0
 
+# --- exitctl health
+real = {k: getattr(ex, k) for k in ("can_connect", "cert_report", "exits_health", "probe_tls", "resolve_ipv4")}
+ex.can_connect = lambda h: True
+ex.cert_report = lambda d: {"domain": d, "ok": True, "days_left": 60, "error": None}
+ex.exits_health = lambda e: [{"name": o["tag"][5:], "ok": True, "ms": 10} for o in ex.exits_list(e)]
+def health():
+    c, o, e = cli("health", "--json")
+    return c, (json.loads(o) if o else {}), e
+put(bridge_base(src_clients, "P", ["aa"]), [exit_nl, exit_us])
+c, h, e = health()
+expect("health: всё в порядке, код 0", c == 0 and h["mode"] == "bridge" and h["problems"] == [] and h["warnings"] == [] and len(h["exits"]) == 2, (c, h, e))
+ex.exits_health = lambda e: [{"name": "nl1", "ok": False, "ms": None}, {"name": "us1", "ok": True, "ms": 10}]
+c, h, e = health()
+expect("health: один выход недоступен — предупреждение", c == 0 and not h["problems"] and "nl1" in h["warnings"][0], h)
+b = bridge_base(src_clients, "P", ["aa"]); b["routing"]["rules"][-1] = {"ruleTag": "to-exits", "inboundTag": ["in"], "outboundTag": "exit-nl1"}
+put(b, [exit_nl, exit_us])
+c, h, e = health()
+expect("health: закреплён недоступный выход — проблема", c == 1 and any("закреплён" in p for p in h["problems"]), h)
+ex.exits_health = lambda e: [{"name": "nl1", "ok": False, "ms": None}, {"name": "us1", "ok": False, "ms": None}]
+c, h, e = health()
+expect("health: все выходы недоступны", c == 1 and any("ни до одного" in p for p in h["problems"]), h)
+put(bridge_base(src_clients, "P", ["aa"]), [])
+ex.exits_health = real["exits_health"]
+c, h, e = health()
+expect("health: выходов нет", c == 1 and any("выходов нет" in p for p in h["problems"]), h)
+ex.cert_report = lambda d: {"domain": d, "ok": True, "days_left": 5, "error": None}
+put(bridge_base(src_clients, "P", ["aa"]), [exit_us]); ex.exits_health = lambda e: [{"name": "us1", "ok": True, "ms": 1}]
+c, h, e = health()
+expect("health: сертификат SNI скоро истекает — предупреждение", c == 0 and any("5 дн." in w for w in h["warnings"]), h)
+ex.cert_report = lambda d: {"domain": d, "ok": False, "days_left": None, "error": "сайт не отвечает по TLS: timeout"}
+c, h, e = health()
+expect("health: сайт SNI сломан — проблема", c == 1 and any("site.example" in p for p in h["problems"]), h)
+ex.cert_report = lambda d: {"domain": d, "ok": True, "days_left": 60, "error": None}
+ex.can_connect = lambda h: h == "ya.ru"
+c, h, e = health()
+expect("health: мосту хватает ya.ru", c == 0 and not h["problems"], h)
+simple = json.loads(json.dumps(base)); put(simple, [])
+c, h, e = health()
+expect("health: простому режиму закрыли зарубежный трафик", c == 1 and h["mode"] == "simple" and any("github.com" in p for p in h["problems"]) and h["exits"] is None, h)
+ex.can_connect = lambda h: True
+restore_run = ex.subprocess.run
+ex.subprocess.run = lambda cmd, **k: types.SimpleNamespace(returncode=3, stdout="inactive", stderr="") if list(cmd)[:2] == ["systemctl", "is-active"] else restore_run(cmd, **k)
+c, h, e = health()
+expect("health: Xray не работает", c == 1 and h["xray"] is False and any("Xray не работает" in p for p in h["problems"]), h)
+ex.subprocess.run = restore_run
+c, o, e = cli("health")
+expect("health текстом", c == 0 and "в порядке" in o, o)
+expect("health: неверный параметр", cli("health", "--foo")[0] == 1)
+c, h, e = health()
+os.remove(os.path.join(tmp, "00_base.json"))
+c2, h2, e2 = health()
+expect("health: выход проверяется без выходов и пользователей", c2 == 0 and h2["mode"] == "exit" and h2["sni"]["domain"] == "x.org" and h2["exits"] is None, h2)
+os.remove(ex_path)
+c, h, e = health()
+expect("health: не настроен — без проблем", c == 0 and h["installed"] is False and h["problems"] == [], h)
+for k, v in real.items():
+    setattr(ex, k, v)
+ex.resolve_ipv4 = lambda d: ["192.0.2.10"]
+def tls(version="TLSv1.3", err=None, cert_err=None, days=40):
+    import time as _t
+    exp = _t.strftime("%b %d %H:%M:%S %Y GMT", _t.gmtime(_t.time() + days * 86400 + 3600))
+    return lambda d, ip: {"error": err, "cert_error": cert_err, "version": version, "cert": {"notAfter": exp}}
+ex.probe_tls = tls()
+r = ex.cert_report("site.example")
+expect("cert_report: срок действия", r["ok"] and r["days_left"] == 40, r)
+ex.probe_tls = tls(cert_err="certificate has expired")
+expect("cert_report: истёкший сертификат", not ex.cert_report("site.example")["ok"])
+ex.probe_tls = tls(version="TLSv1.2")
+expect("cert_report: нет TLS 1.3", "TLS 1.3" in (ex.cert_report("site.example")["error"] or ""))
+ex.probe_tls = tls(err="timed out")
+expect("cert_report: не отвечает", "не отвечает" in (ex.cert_report("site.example")["error"] or ""))
+ex.resolve_ipv4 = lambda d: []
+expect("cert_report: нет DNS", ex.cert_report("site.example")["error"] == "домен не резолвится")
+for k, v in real.items():
+    setattr(ex, k, v)
+
 shutil.rmtree(tmp, ignore_errors=True)
 print("Всего:", len(res), "ошибок:", res.count(False))
 sys.exit(1 if False in res else 0)

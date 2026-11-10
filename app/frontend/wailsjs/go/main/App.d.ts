@@ -29,6 +29,8 @@ export function DeleteServer(arg1:string):Promise<void>;
 
 export function ExitLink(arg1:string):Promise<string>;
 
+export function Health(arg1:string):Promise<any>;
+
 export function InspectBackup(arg1:string):Promise<backup.Header>;
 
 export function Install(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;

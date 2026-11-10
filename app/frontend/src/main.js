@@ -1,13 +1,13 @@
 import './style.css';
 import {
-  AddDirect, AddExit, AddUser, AllowBridgeOnExit, BackupServer, ChooseBackupOpen, ChooseBackupSave, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Install, ListExits,
+  AddDirect, AddExit, AddUser, AllowBridgeOnExit, BackupServer, ChooseBackupOpen, ChooseBackupSave, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Health, Install, ListExits,
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
   InspectBackup, ListDirect, MigrateUsers, RemoveDirect, RestoreBackup, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
 } from '../wailsjs/go/main/App';
-import { ClipboardSetText, EventsOn } from '../wailsjs/runtime/runtime';
+import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
 
 const root = document.getElementById('app');
-const state = { servers: [], selected: null, view: 'empty', editing: null };
+const state = { servers: [], selected: null, view: 'empty', editing: null, health: {}, healthRunning: false };
 let logTarget = null;
 
 // Весь текст попадает в страницу через textContent: данные с серверов разметкой не становятся.
@@ -107,14 +107,89 @@ function formatUptime(s) {
   return d ? `${d} д ${hh} ч` : `${hh} ч ${m} мин`;
 }
 
+// --- Наблюдение: exitctl health на всех серверах при запуске и каждые 15 минут, пока открыто приложение.
+const HEALTH_EVERY_MS = 15 * 60 * 1000;
+const HEALTH_TITLES = { ok: 'проблем нет', warn: 'есть предупреждения', fail: 'есть проблемы', none: 'не настроен', unknown: 'не проверен' };
+const timeStr = (d) => d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+
+async function checkHealth(id) {
+  let entry;
+  try {
+    const rep = await Health(id);
+    entry = !rep.installed ? { level: 'none', problems: [], warnings: [] }
+      : { level: rep.problems.length ? 'fail' : rep.warnings.length ? 'warn' : 'ok', problems: rep.problems, warnings: rep.warnings };
+  } catch (e) {
+    const m = msg(e);
+    // Ключ сервера подтверждает только пользователь: фоновая проверка диалогов не показывает.
+    entry = m.startsWith('UNKNOWN_HOST:')
+      ? { level: 'unknown', problems: [], warnings: ['ключ сервера ещё не подтверждён: откройте сервер, чтобы его проверять'] }
+      : { level: 'fail', warnings: [], problems: [m.startsWith('HOST_KEY_CHANGED:')
+        ? 'ключ сервера изменился, подключение остановлено: откройте сервер, чтобы узнать подробности'
+        : `не удалось связаться с сервером: ${m}`] };
+  }
+  if (!state.servers.some((s) => s.id === id)) return;
+  state.health[id] = { ...entry, at: new Date() };
+  updateHealthViews(id);
+}
+
+async function checkAllHealth() {
+  if (state.healthRunning) return;
+  state.healthRunning = true;
+  updateSide();
+  try {
+    for (const s of [...state.servers]) await checkHealth(s.id);
+  } finally {
+    state.healthRunning = false;
+    updateSide();
+  }
+}
+
+function updateSide() {
+  document.querySelector('aside.side')?.replaceWith(renderSide());
+  const bad = state.servers.filter((s) => state.health[s.id]?.level === 'fail').length;
+  WindowSetTitle(bad ? `Переправа — проблемы: ${bad}` : 'Переправа');
+}
+
+function updateHealthViews(id) {
+  updateSide();
+  document.querySelectorAll(`[data-health="${id}"]`).forEach((el) => el.replaceWith(healthNotice(id)));
+}
+
+function healthNotice(id) {
+  const hs = state.health[id];
+  const box = h('div', { 'data-health': id });
+  if (!hs || hs.level === 'none') return box;
+  if (hs.level === 'ok') {
+    box.append(h('p', { class: 'hint pass', style: 'margin:0 0 10px' }, `Наблюдение: проблем нет, проверено в ${timeStr(hs.at)}.`));
+    return box;
+  }
+  const again = h('button', { style: 'margin-top:8px' }, 'Проверить снова');
+  again.addEventListener('click', () => { again.disabled = true; checkHealth(id); });
+  box.append(h('div', { class: `notice${hs.level === 'fail' ? ' notice-bad' : ''}` },
+    h('b', {}, hs.level === 'fail' ? 'Проблемы на сервере' : 'Стоит проверить'),
+    h('ul', { class: 'health-list' }, [...hs.problems, ...hs.warnings].map((t) => h('li', {}, t))),
+    h('small', {}, `Проверено в ${timeStr(hs.at)}. Приложение проверяет все серверы каждые 15 минут, пока оно открыто.`),
+    h('div', {}, again)));
+  return box;
+}
+
 function renderSide() {
+  const last = Object.values(state.health).map((x) => x.at).sort((a, b) => b - a)[0];
+  const checkBtn = h('button', { class: 'link-btn', disabled: state.healthRunning || !state.servers.length },
+    state.healthRunning ? 'Проверяю серверы...' : 'Проверить все');
+  checkBtn.addEventListener('click', checkAllHealth);
   return h('aside', { class: 'side' },
     h('h1', {}, 'Переправа'),
-    state.servers.map((s) => h('button', {
-      class: `server-item${state.selected === s.id && state.view === 'server' ? ' active' : ''}`,
-      onclick: () => openServer(s.id),
-    }, s.name, h('small', {}, `${s.user}@${s.host}`))),
-    h('button', { onclick: () => openForm(null) }, '+ Добавить сервер'));
+    state.servers.map((s) => {
+      const level = state.health[s.id]?.level || 'unknown';
+      return h('button', {
+        class: `server-item${state.selected === s.id && state.view === 'server' ? ' active' : ''}`,
+        onclick: () => openServer(s.id),
+        title: HEALTH_TITLES[level],
+      }, h('span', { class: `dot dot-${level}` }), s.name, h('small', {}, `${s.user}@${s.host}`));
+    }),
+    h('button', { onclick: () => openForm(null) }, '+ Добавить сервер'),
+    h('div', { class: 'side-foot' }, last && !state.healthRunning ? h('small', {}, `Проверено в ${timeStr(last)}`) : null, checkBtn));
 }
 
 function render(main) {
@@ -275,7 +350,10 @@ function renderServerBody(body, server, st) {
       : st.mode === 'bridge' ? [exitsPanel(server), usersPanel(server, st), directPanel(server), migratePanel(server, st)]
         : [usersPanel(server, st), migratePanel(server, st)];
   if (st.installed) panels.push(maintenancePanel(server, st));
-  body.replaceChildren(...[egressWarning(st), statusPanel(st), ...panels].filter(Boolean));
+  body.replaceChildren(...[healthNotice(server.id), egressWarning(st), statusPanel(st), ...panels].filter(Boolean));
+  // Открытый сервер проверяем заново, если результат старше 5 минут.
+  const hs = state.health[server.id];
+  if (!hs || Date.now() - hs.at > 5 * 60 * 1000) checkHealth(server.id);
 }
 
 function maintenancePanel(server, st) {
@@ -868,5 +946,8 @@ EventsOn('log', (line) => {
     renderEmpty();
   } catch (e) {
     render(h('div', { class: 'error' }, msg(e)));
+    return;
   }
+  checkAllHealth();
+  setInterval(checkAllHealth, HEALTH_EVERY_MS);
 })();

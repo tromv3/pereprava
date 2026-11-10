@@ -372,6 +372,10 @@ func (a *App) Status(id string) (any, error) {
 	return st, nil
 }
 
+// Health возвращает проблемы сервера (exitctl health): интерфейс проверяет все серверы по таймеру.
+// python3 здесь не ставится: если его нет, сервер ещё не настраивали, и проверять нечего.
+func (a *App) Health(id string) (any, error) { return a.tool(id, false, "health", "--json") }
+
 // UpdateTool ставит на сервер exitctl из приложения: для тех, кто пользуется им в консоли сервера.
 func (a *App) UpdateTool(id string) error {
 	c, err := a.connect(id)

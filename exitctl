@@ -19,6 +19,7 @@
   exitctl user link <имя> [--host АДРЕС]           показать ссылку пользователя
   exitctl user remove <имя>                        удалить пользователя
   exitctl status [--json]                          состояние сервера и Xray
+  exitctl health [--json]                          проблемы сервера: Xray, выходы, сертификат SNI, исходящий трафик (код 1 — есть проблемы)
   exitctl reach <адрес> <порт> [--json]            достаёт ли этот сервер до адреса (код 1 — нет)
   exitctl migrate export                           пользователи, ключи Reality, выходы и сайты напрямую (JSON)
   exitctl migrate import <файл> [--keys] [--json]  добавить их сюда; --keys заменяет ключи Reality
@@ -423,28 +424,31 @@ def cmd_auto():
     print("Включён автовыбор самого быстрого живого выхода.")
 
 
-def cmd_check(as_json=False):
-    ex = load(EXITS, {"outbounds": []})
-    items = exits_list(ex)
+def exits_health(ex):
+    """TCP до каждого выхода: [{name, ok, ms, address, port, error}]."""
     rows = []
-    if not items and not as_json:
-        print("Выходов нет.")
-        return
-    for o in items:
+    for o in exits_list(ex):
         a, p, _ = info(o)
         t0 = time.time()
         try:
             with socket.create_connection((a, p), timeout=4):
-                ms = int((time.time() - t0) * 1000)
-                res, ok = f"OK, {ms} мс", True
+                ms, ok, err = int((time.time() - t0) * 1000), True, None
         except OSError as e:
-            ms, ok = None, False
-            res = f"НЕДОСТУПЕН ({e.__class__.__name__})"
-        rows.append({"name": o["tag"][len(PREFIX):], "ok": ok, "ms": ms})
-        if not as_json:
-            print(f'{o["tag"][len(PREFIX):]:<20} {a}:{p:<6} {res}')
+            ms, ok, err = None, False, e.__class__.__name__
+        rows.append({"name": o["tag"][len(PREFIX):], "ok": ok, "ms": ms, "address": a, "port": p, "error": err})
+    return rows
+
+
+def cmd_check(as_json=False):
+    rows = exits_health(load(EXITS, {"outbounds": []}))
     if as_json:
-        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        print(json.dumps([{k: r[k] for k in ("name", "ok", "ms")} for r in rows], ensure_ascii=False, indent=2))
+        return
+    if not rows:
+        print("Выходов нет.")
+    for r in rows:
+        res = f'OK, {r["ms"]} мс' if r["ok"] else f'НЕДОСТУПЕН ({r["error"]})'
+        print(f'{r["name"]:<20} {r["address"]}:{r["port"]:<6} {res}')
 
 
 def cmd_direct(action, domain=None, as_json=False):
@@ -1209,6 +1213,85 @@ def cmd_status(a):
         print("Xray через эти скрипты не настроен.")
 
 
+def cert_report(domain):
+    """Сертификат сайта, под который маскируется сервер: Reality показывает клиентам именно его.
+
+    Если сайт сломался или сертификат истёк, соединения с сервером начинают выглядеть подозрительно,
+    а часть клиентов перестаёт подключаться: SNI тогда надо менять.
+    """
+    rep = {"domain": domain, "ok": False, "days_left": None, "error": None}
+    ips = resolve_ipv4(domain)
+    if not ips:
+        rep["error"] = "домен не резолвится"
+        return rep
+    res = probe_tls(domain, ips[0])
+    if res["error"]:
+        rep["error"] = "сайт не отвечает по TLS: " + res["error"]
+    elif res["cert_error"]:
+        rep["error"] = "сертификат не проходит проверку: " + res["cert_error"]
+    elif res["version"] != "TLSv1.3":
+        rep["error"] = f'сайт больше не отдаёт TLS 1.3 ({res["version"]})'
+    else:
+        rep["days_left"] = cert_details(res["cert"])["days_left"]
+        rep["ok"] = True
+    return rep
+
+
+def health_report():
+    """Что сломалось или скоро сломается: problems — уже не работает, warnings — стоит посмотреть."""
+    st = status_report()
+    rep = {"installed": st["installed"], "mode": st["mode"], "xray": st["xray"]["active"],
+           "sni": None, "exits": None, "egress": st["egress"], "problems": [], "warnings": []}
+    if not st["installed"]:
+        return rep
+    problems, warnings = rep["problems"], rep["warnings"]
+    if not st["xray"]["active"]:
+        problems.append("Xray не работает: клиенты не могут подключиться")
+    blocked = [h for h, ok in st["egress"].items() if not ok]
+    if not st["capabilities"].get(st["mode"]):
+        problems.append("хостер ограничил исходящий трафик, для этой роли его не хватает: нет связи с "
+                        + ", ".join(blocked))
+    if st["sni"]:
+        cert = rep["sni"] = cert_report(st["sni"])
+        if not cert["ok"]:
+            problems.append(f'сайт для SNI {st["sni"]}: {cert["error"]}')
+        elif cert["days_left"] < SNI_CERT_MIN_DAYS:
+            warnings.append(f'сертификат сайта для SNI {st["sni"]} истекает через {cert["days_left"]} дн.: '
+                            "если владелец его не продлит, SNI придётся сменить")
+    if st["mode"] == "bridge":
+        rows = rep["exits"] = exits_health(load(EXITS, {"outbounds": []}))
+        dead = [r["name"] for r in rows if not r["ok"]]
+        if not rows:
+            problems.append("выходов нет: открываются только сайты, которые мост пускает напрямую")
+        elif len(dead) == len(rows):
+            problems.append("мост не достаёт ни до одного выхода: " + ", ".join(dead))
+        elif dead:
+            warnings.append("недоступны выходы: " + ", ".join(dead) + "; трафик идёт через остальные")
+        pinned = (find_rule(load(BASE), RULE_EXITS) or {}).get("outboundTag")
+        if pinned and pinned[len(PREFIX):] in dead and len(dead) < len(rows):
+            problems.append(f"весь трафик закреплён за выходом {pinned[len(PREFIX):]}, а он недоступен: "
+                            "включите автовыбор или закрепите другой")
+    return rep
+
+
+def cmd_health(a):
+    if a not in ([], ["--json"]):
+        die("используйте: exitctl health [--json]")
+    rep = health_report()
+    if a:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    elif not rep["installed"]:
+        print("Сервер не настроен.")
+    else:
+        for p in rep["problems"]:
+            print("ПРОБЛЕМА:", p)
+        for w in rep["warnings"]:
+            print("Внимание:", w)
+        if not rep["problems"] and not rep["warnings"]:
+            print("Всё в порядке.")
+    sys.exit(1 if rep["problems"] else 0)
+
+
 def reach_report(host, port):
     """Достаёт ли этот сервер до host:port. Отказ в соединении — тоже связь: порт просто закрыт."""
     try:
@@ -1389,6 +1472,8 @@ def main(a):
         cmd_user(a[1:])
     elif c == "status":
         cmd_status(a[1:])
+    elif c == "health":
+        cmd_health(a[1:])
     elif c == "reach":
         cmd_reach(a[1:])
     elif c == "migrate":
