@@ -181,3 +181,7 @@ td.actions button { margin-left: 6px; }
 .link { font: 12px Consolas, monospace; overflow-wrap: anywhere; user-select: text; }
 .mono { font-family: Consolas, monospace; overflow-wrap: anywhere; white-space: pre-wrap; }
 .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+.help { margin-top: 10px; font-size: 12.5px; color: var(--muted); }
+.help summary { cursor: pointer; color: var(--accent, inherit); }
+.help ul { margin: 6px 0 0 20px; padding: 0; }
+.help li { margin: 3px 0; overflow-wrap: anywhere; }
