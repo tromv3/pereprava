@@ -418,7 +418,7 @@ func (a *App) UpdateXray(id string) error {
 	if err := c.client.Upload(a.ctx, dir+"/xray", files["xray"], "700"); err != nil {
 		return err
 	}
-	return a.runScript(c, "update-xray.sh", " "+remote.Quote(dir), "обновление Xray не удалось")
+	return a.runDetached(id, c, "update-xray.sh", " "+remote.Quote(dir), "обновление Xray не удалось")
 }
 
 // MigrateUsers переносит пользователей (на мосту — ещё выходы и сайты напрямую) с srcID на dstID.
@@ -749,13 +749,135 @@ func (a *App) runScript(c *conn, script, args, failMsg string) error {
 	return nil
 }
 
+// runDetached запускает скрипт на сервере отдельно от SSH-сессии (systemd-run) и следит за ним опросом.
+// Скрипты, перезапускающие Xray, обрывают SSH, если компьютер ходит на сервер через этот же Xray:
+// тогда приложение переподключается и дочитывает журнал и код выхода.
+func (a *App) runDetached(id string, c *conn, script, args, failMsg string) error {
+	unit := "pereprava-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	job := c.dir + "/" + unit
+	if err := c.client.Upload(a.ctx, job+".sh", []byte(jobScript(c.dir+"/"+script, args, job)), "700"); err != nil {
+		return err
+	}
+	r, err := c.client.Run(a.ctx, "systemd-run --quiet --collect --unit="+unit+" /bin/bash "+remote.Quote(job+".sh"), true, nil)
+	if err != nil {
+		return err
+	}
+	if r.Code != 0 {
+		return fmt.Errorf("%s: не удалось запустить задание: %s", failMsg, strings.TrimSpace(r.Stderr+" "+r.Stdout))
+	}
+	poll := "systemctl is-active --quiet " + unit + " && echo run || echo stop; cat " + remote.Quote(job+".rc") +
+		" 2>/dev/null; echo; echo " + pollMark + "; cat " + remote.Quote(job+".log") + " 2>/dev/null"
+	shown := 0
+	deadline := time.Now().Add(15 * time.Minute)
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s: задание на сервере не закончилось за 15 минут", failMsg)
+		}
+		ctx, cancel := context.WithTimeout(a.ctx, 20*time.Second)
+		r, err := c.client.Run(ctx, poll, true, nil)
+		cancel()
+		if err != nil {
+			a.emit("Связь с сервером прервалась, переподключаюсь...")
+			if c, err = a.reconnect(id, deadline); err != nil {
+				return fmt.Errorf("%s: связь с сервером потеряна, а задание на сервере могло закончиться: %w", failMsg, err)
+			}
+			continue
+		}
+		st := parsePoll(r.Stdout)
+		for ; shown < len(st.lines); shown++ {
+			a.emit(st.lines[shown])
+		}
+		if st.done || !st.running {
+			_, _ = c.client.Run(a.ctx, "rm -f "+remote.Quote(job+".sh")+" "+remote.Quote(job+".rc")+" "+remote.Quote(job+".log"), true, nil)
+			if !st.done {
+				return fmt.Errorf("%s: задание на сервере прервалось без кода выхода", failMsg)
+			}
+			if st.code != 0 {
+				return fmt.Errorf("%s, код %d: смотрите журнал", failMsg, st.code)
+			}
+			return nil
+		}
+		select {
+		case <-a.ctx.Done():
+			return a.ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// reconnect заново подключается к серверу, пока не выйдет срок: после перезапуска Xray туннель поднимается не сразу.
+func (a *App) reconnect(id string, deadline time.Time) (*conn, error) {
+	a.mu.Lock()
+	if old, ok := a.conns[id]; ok {
+		old.client.Close()
+		delete(a.conns, id)
+	}
+	a.mu.Unlock()
+	for {
+		c, err := a.connect(id)
+		if err == nil {
+			a.emit("Связь восстановлена.")
+			return c, nil
+		}
+		if time.Now().Add(5 * time.Second).After(deadline) {
+			return nil, err
+		}
+		select {
+		case <-a.ctx.Done():
+			return nil, a.ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+const pollMark = "@@pereprava-log@@"
+
+// jobScript — обёртка для systemd-run: журнал в .log, код выхода в .rc (атомарно, через .tmp).
+func jobScript(script, args, job string) string {
+	return "#!/bin/bash\n" +
+		"bash " + remote.Quote(script) + args + " >" + remote.Quote(job+".log") + " 2>&1\n" +
+		"echo $? >" + remote.Quote(job+".rc.tmp") + "\n" +
+		"mv " + remote.Quote(job+".rc.tmp") + " " + remote.Quote(job+".rc") + "\n"
+}
+
+type pollState struct {
+	running, done bool
+	code          int
+	lines         []string
+}
+
+// parsePoll разбирает ответ опроса: состояние юнита, код выхода (если есть), затем журнал.
+// Пока задание идёт, последняя строка журнала без перевода строки не показывается: она может быть недописана.
+func parsePoll(out string) pollState {
+	head, log, _ := strings.Cut(out, pollMark+"\n")
+	var st pollState
+	f := strings.Fields(head)
+	if len(f) > 0 {
+		st.running = f[0] == "run"
+	}
+	if len(f) > 1 {
+		if n, err := strconv.Atoi(f[1]); err == nil {
+			st.done, st.code = true, n
+		}
+	}
+	log = strings.ReplaceAll(log, "\r", "")
+	if !st.done {
+		log = log[:strings.LastIndex(log, "\n")+1]
+	}
+	log = strings.TrimSuffix(log, "\n")
+	if log != "" {
+		st.lines = strings.Split(log, "\n")
+	}
+	return st
+}
+
 // Uninstall снимает установку: Xray, конфиги, ссылки и правила файрвола для 443.
 func (a *App) Uninstall(id string) error {
 	c, err := a.connect(id)
 	if err != nil {
 		return err
 	}
-	return a.runScript(c, "uninstall.sh", "", "удаление не удалось")
+	return a.runDetached(id, c, "uninstall.sh", "", "удаление не удалось")
 }
 
 // UpdateGeodata скачивает свежие списки сайтов на этом компьютере и ставит их на сервер.
@@ -781,7 +903,7 @@ func (a *App) UpdateGeodata(id string) error {
 			return err
 		}
 	}
-	return a.runScript(c, "update-geodata.sh", " "+remote.Quote(dir), "обновление не удалось")
+	return a.runDetached(id, c, "update-geodata.sh", " "+remote.Quote(dir), "обновление не удалось")
 }
 
 // plainTool запускает команду exitctl, результат которой нужен только как успех или ошибка.

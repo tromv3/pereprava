@@ -51,3 +51,31 @@ func TestModeAllowed(t *testing.T) {
 		t.Error("без данных о сервере режим должен быть запрещён")
 	}
 }
+
+func TestParsePoll(t *testing.T) {
+	st := parsePoll("run\n\n" + pollMark + "\nпервая\nнедопис")
+	if !st.running || st.done || len(st.lines) != 1 || st.lines[0] != "первая" {
+		t.Fatalf("идёт: %+v", st)
+	}
+	st = parsePoll("stop\n3\n\n" + pollMark + "\nпервая\r\nпоследняя")
+	if st.running || !st.done || st.code != 3 || len(st.lines) != 2 || st.lines[1] != "последняя" {
+		t.Fatalf("закончилось: %+v", st)
+	}
+	st = parsePoll("stop\n\n" + pollMark + "\n")
+	if st.done || st.running || len(st.lines) != 0 {
+		t.Fatalf("прервалось: %+v", st)
+	}
+	st = parsePoll("run\n0\n\n" + pollMark + "\n")
+	if !st.done || st.code != 0 {
+		t.Fatalf("код записан, юнит ещё не ушёл: %+v", st)
+	}
+}
+
+func TestJobScript(t *testing.T) {
+	s := jobScript("/tmp/d/update-xray.sh", " '/tmp/d/x'", "/tmp/d/job")
+	want := "#!/bin/bash\nbash '/tmp/d/update-xray.sh' '/tmp/d/x' >'/tmp/d/job.log' 2>&1\n" +
+		"echo $? >'/tmp/d/job.rc.tmp'\nmv '/tmp/d/job.rc.tmp' '/tmp/d/job.rc'\n"
+	if s != want {
+		t.Fatalf("%q", s)
+	}
+}
