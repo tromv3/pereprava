@@ -26,6 +26,8 @@ done
 
 if xray run -test "${TEST[@]}" >/dev/null 2>&1; then
   rm -f "$DST"/*.bak
+  # Счётчики трафика живут до перезапуска Xray: сохраняем их в учёт exitctl (на выходе его нет).
+  [ -x /usr/local/bin/exitctl ] && [ -f /usr/local/etc/xray/conf.d/00_base.json ] && /usr/local/bin/exitctl user enforce >/dev/null 2>&1 || true
   systemctl restart xray
   echo "Списки сайтов обновлены, Xray перезапущен."
 else

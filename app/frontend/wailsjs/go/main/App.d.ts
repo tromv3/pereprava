@@ -53,11 +53,17 @@ export function RemoveExit(arg1:string,arg2:string):Promise<void>;
 
 export function RemoveUser(arg1:string,arg2:string):Promise<void>;
 
+export function ResetUserTraffic(arg1:string,arg2:string):Promise<any>;
+
 export function RestoreBackup(arg1:string,arg2:string,arg3:string,arg4:boolean):Promise<any>;
 
 export function SaveServer(arg1:main.ServerInput):Promise<main.ServerView>;
 
 export function ScanSNI(arg1:string,arg2:string):Promise<any>;
+
+export function SetUserEnabled(arg1:string,arg2:string,arg3:boolean):Promise<any>;
+
+export function SetUserLimit(arg1:string,arg2:string,arg3:string,arg4:number):Promise<any>;
 
 export function Status(arg1:string):Promise<any>;
 

@@ -18,6 +18,11 @@
   exitctl user add <имя> [--host АДРЕС] [--json]   добавить пользователя
   exitctl user link <имя> [--host АДРЕС]           показать ссылку пользователя
   exitctl user remove <имя>                        удалить пользователя
+  exitctl user limit <имя> [--days N | --until ДАТА | --no-expiry] [--traffic ГБ | --no-traffic] [--json]
+                                                   срок доступа и лимит трафика
+  exitctl user disable|enable <имя> [--json]       отключить или включить (ссылка не меняется)
+  exitctl user reset <имя> [--json]                обнулить накопленный трафик пользователя
+  exitctl user enforce [--json]                    учесть трафик и отключить вышедших за пределы (cron)
   exitctl status [--json]                          состояние сервера и Xray
   exitctl health [--json]                          проблемы сервера: Xray, выходы, сертификат SNI, исходящий трафик (код 1 — есть проблемы)
   exitctl reach <адрес> <порт> [--json]            достаёт ли этот сервер до адреса (код 1 — нет)
@@ -40,6 +45,12 @@ RULE_EXITS = "to-exits"
 RULE_DIRECT = "user-direct"
 API_SERVER = "127.0.0.1:10085"
 LIVE_SERVICES = ("HandlerService", "RoutingService")  # пользователи, выходы и правила без перезапуска
+# Сроки, лимиты, накопленный трафик и отключённые пользователи. Лежит вне conf.d: Xray читает оттуда все *.json.
+USERS_META = os.environ.get("XRAY_USERS_META",
+                            os.path.join(os.path.dirname(CONF_DIR.rstrip("/\\")), "exitctl-users.json"))
+CRON_FILE = os.environ.get("EXITCTL_CRON", "/etc/cron.d/exitctl-users")
+GB = 1024 ** 3
+LIMIT_REASONS = {"expired": "истёк срок", "traffic": "исчерпан трафик", "manual": "отключён вручную"}
 SNI_PORT = 443
 SNI_TIMEOUT = 6
 SNI_MAX_RTT_MS = 30
@@ -140,6 +151,11 @@ def restart_xray():
     if NO_RESTART:
         print("Конфиг OK (перезапуск пропущен: XRAY_NO_RESTART=1)")
         return
+    # Счётчики Xray живут до перезапуска: сначала переносим их в накопленный трафик.
+    if os.path.exists(BASE):
+        meta = load_meta()
+        if collect_traffic(meta):
+            save_meta(meta)
     r = subprocess.run(["systemctl", "restart", "xray"], capture_output=True, text=True)
     if r.returncode != 0:
         die("не удалось перезапустить xray: " + r.stderr.strip())
@@ -234,8 +250,8 @@ def apply_routing_change(base, ex, old_ex):
     return True
 
 
-def apply_user_change(base, ex, action, client):
-    """Записать конфиг и применить изменение пользователя. True, если Xray пришлось перезапустить.
+def apply_users_change(base, ex, added=(), removed=()):
+    """Записать конфиг и применить изменения пользователей. True, если Xray пришлось перезапустить.
 
     Конфиг на диске меняется всегда, чтобы после любого перезапуска состояние совпадало.
     Запущенному Xray изменение передаётся через API; если API недоступен или отказал — перезапуск.
@@ -244,18 +260,13 @@ def apply_user_change(base, ex, action, client):
         apply(base, ex)
         return True
     write_and_test(base, ex)
-    if action == "add":
+    ok = True
+    if added:
         ib = json.loads(json.dumps(inbound_in(base)))
-        ib["settings"]["clients"] = [client]
-        fd, path = tempfile.mkstemp(suffix=".json")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump({"inbounds": [ib]}, f)
-            ok = api_call("adu", path)
-        finally:
-            os.remove(path)
-    else:
-        ok = api_call("rmu", "-tag=in", client_name(client))
+        ib["settings"]["clients"] = list(added)
+        ok = api_json("adu", {"inbounds": [ib]})
+    for c in removed:
+        ok = ok and api_call("rmu", "-tag=in", client_name(c))
     if ok:
         print("Изменение применено без перезапуска Xray.")
         return False
@@ -979,15 +990,8 @@ def client_link(base, client, host, pub):
             + (f"&flow={flow}" if flow else "") + f"#{client_name(client)}")
 
 
-def user_traffic():
-    """{имя: {uplink, downlink}} или None, если счётчики недоступны.
-
-    Пустой ответ — это не ошибка: пока трафика не было, Xray не возвращает ни одного счётчика.
-    Счётчики обнуляются при каждом перезапуске Xray.
-    """
-    out = run_text(XRAY, "api", "statsquery", f"--server={API_SERVER}", "-pattern", "user>>>")
-    if out is None:
-        return None
+def parse_traffic(out):
+    """{имя: {uplink, downlink}} из ответа statsquery или None, если ответ не разобрать."""
     try:
         stats = json.loads(out or "{}").get("stat") or []
     except ValueError:
@@ -1000,96 +1004,358 @@ def user_traffic():
     return res
 
 
-def users_report(base, host):
+def user_traffic():
+    """{имя: {uplink, downlink}} или None, если счётчики недоступны.
+
+    Пустой ответ — это не ошибка: пока трафика не было, Xray не возвращает ни одного счётчика.
+    Здесь только то, что накопилось с последнего сбора (collect_traffic) или перезапуска Xray.
+    """
+    out = run_text(XRAY, "api", "statsquery", f"--server={API_SERVER}", "-pattern", "user>>>")
+    return None if out is None else parse_traffic(out)
+
+
+def load_meta():
+    meta = load(USERS_META, {})
+    meta.setdefault("users", {})
+    return meta
+
+
+def save_meta(meta):
+    save(USERS_META, meta)
+    with contextlib.suppress(OSError):
+        os.chmod(USERS_META, 0o600)  # здесь UUID отключённых пользователей
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Одно изменение за раз: cron (user enforce) и приложение могут работать одновременно."""
+    try:
+        import fcntl
+    except ImportError:  # Windows, тесты
+        yield
+        return
+    if not os.path.isdir(os.path.dirname(USERS_META)):
+        yield
+        return
+    fd = os.open(USERS_META + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def collect_traffic(meta):
+    """Перенести счётчики Xray в накопленный трафик (used) и обнулить их. False, если API недоступен."""
+    out = run_text(XRAY, "api", "statsquery", f"--server={API_SERVER}", "-pattern", "user>>>", "-reset")
+    traffic = None if out is None else parse_traffic(out)
+    if traffic is None:
+        return False
+    for name, t in traffic.items():
+        u = meta["users"].setdefault(name, {})
+        u["used"] = u.get("used", 0) + t.get("uplink", 0) + t.get("downlink", 0)
+    return True
+
+
+def reconcile(meta, base):
+    """Пользователь, который есть в конфиге, не может числиться отключённым.
+
+    Так бывает, если изменение конфига сорвалось после записи файла с ограничениями.
+    """
+    for c in inbound_in(base)["settings"]["clients"]:
+        m = meta["users"].get(client_name(c))
+        if m:
+            m.pop("client", None)
+            m.pop("disabled", None)
+
+
+def limit_reason(m, now):
+    if m.get("expires") and now >= m["expires"]:
+        return "expired"
+    if m.get("limit") and m.get("used", 0) >= m["limit"]:
+        return "traffic"
+    return None
+
+
+def disable_client(base, meta, client, reason):
+    inbound_in(base)["settings"]["clients"].remove(client)
+    m = meta["users"].setdefault(client_name(client), {})
+    m.update(client=client, disabled=reason)
+
+
+def enable_client(base, meta, name):
+    m = meta["users"][name]
+    client = m.pop("client")
+    m.pop("disabled", None)
+    inbound_in(base)["settings"]["clients"].append(client)
+    return client
+
+
+def enforce(base, meta, now):
+    """Отключить вышедших за срок или лимит и включить тех, кому их продлили. ([отключённые], [включённые])."""
+    off, on = [], []
+    for c in list(inbound_in(base)["settings"]["clients"]):
+        m = meta["users"].get(client_name(c))
+        reason = m and limit_reason(m, now)
+        if reason:
+            disable_client(base, meta, c, reason)
+            off.append((c, reason))
+    for name, m in meta["users"].items():
+        if m.get("disabled") in ("expired", "traffic") and m.get("client") and not limit_reason(m, now):
+            on.append(enable_client(base, meta, name))
+    return off, on
+
+
+def commit_users(base, ex, meta, added=(), removed=()):
+    """Сначала файл ограничений (в нём копия отключённых), потом конфиг Xray. True, если был перезапуск.
+
+    Если конфиг не применится, reconcile при следующем запуске вернёт файл к конфигу,
+    и ни один пользователь не потеряется.
+    """
+    save_meta(meta)
+    if not added and not removed:
+        return False
+    return apply_users_change(base, ex, added, removed)
+
+
+def ensure_cron():
+    """Учёт трафика и проверка сроков раз в 5 минут. Ставится установщиками и при первом лимите."""
+    if os.path.exists(CRON_FILE) or not os.path.isdir(os.path.dirname(CRON_FILE)):
+        return
+    with open(CRON_FILE, "w") as f:
+        f.write("# exitctl: учёт трафика, сроки и лимиты пользователей\n"
+                f"*/5 * * * * root {INSTALLED_TOOL} user enforce >/dev/null 2>&1\n")
+
+
+def users_report(base, host, meta=None):
     host = host or detect_server_ip()
     pub = public_key(base)
     traffic = user_traffic()
+    meta = meta or load_meta()
+    known = traffic is not None
+    active = inbound_in(base)["settings"]["clients"]
+    rows = [(c, None) for c in active]
+    rows += [(m["client"], m.get("disabled")) for m in meta["users"].values() if m.get("disabled") and m.get("client")]
     users = []
-    for c in inbound_in(base)["settings"]["clients"]:
+    for c, disabled in rows:
         name = client_name(c)
-        t = traffic.get(name, {}) if traffic is not None else {}
-        known = traffic is not None
+        m = meta["users"].get(name, {})
+        t = traffic.get(name, {}) if known else {}
+        up, down = t.get("uplink", 0), t.get("downlink", 0)
         users.append({"name": name, "uuid": c["id"],
-                      "uplink": t.get("uplink", 0) if known else None,
-                      "downlink": t.get("downlink", 0) if known else None,
+                      "uplink": up if known else None,
+                      "downlink": down if known else None,
+                      # Всего: накопленное в файле ограничений плюс то, что Xray насчитал с последнего сбора.
+                      "total": m.get("used", 0) + up + down,
+                      "limit": m.get("limit"), "expires": m.get("expires"),
+                      "disabled": disabled,
                       "link": client_link(base, c, host, pub) if host and pub else None})
     return users
 
 
+def parse_until(v):
+    """Дата окончания: 2026-12-31 (конец дня по времени сервера) или ISO-время с поясом."""
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            y, mo, d = map(int, v.split("-"))
+            return int(time.mktime((y, mo, d, 23, 59, 59, 0, 0, -1)))
+        from datetime import datetime
+        dt = datetime.fromisoformat(v)
+        if dt.tzinfo is None:
+            die("--until: укажите дату (2026-12-31) или время с поясом (2026-12-31T23:59:59+03:00)")
+        return int(dt.timestamp())
+    except (ValueError, OverflowError):
+        die(f"--until: неверная дата {v}")
+
+
+def fmt_date(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "—"
+
+
+def fmt_gb(n):
+    return f"{n / GB:.2f} ГБ" if n is not None else "—"
+
+
 def cmd_user(a):
-    usage = "используйте: exitctl user list|add <имя>|link <имя>|remove <имя> [--host АДРЕС] [--json]"
+    usage = ("используйте: exitctl user list|add|link|remove|limit|disable|enable|reset|enforce [имя] "
+             "[--host АДРЕС] [--json]")
     if not a:
         die(usage)
-    action, rest, as_json, host, name = a[0], a[1:], False, None, None
+    action, rest, name = a[0], a[1:], None
+    opts = {"json": False, "host": None, "days": None, "until": None, "no_expiry": False,
+            "traffic": None, "no_traffic": False}
     while rest:
         o = rest.pop(0)
         if o == "--json":
-            as_json = True
-        elif o == "--host" and rest:
-            host = rest.pop(0)
-            if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
-                die(f"--host: неверный адрес {host}")
+            opts["json"] = True
+        elif o in ("--host", "--days", "--until", "--traffic") and rest:
+            opts[o[2:]] = rest.pop(0)
+        elif o == "--no-expiry":
+            opts["no_expiry"] = True
+        elif o == "--no-traffic":
+            opts["no_traffic"] = True
         elif not o.startswith("-") and name is None:
             name = o
         else:
             die(f"неизвестный параметр {o}")
+    if opts["host"] and not re.fullmatch(r"[A-Za-z0-9.-]+", opts["host"]):
+        die(f'--host: неверный адрес {opts["host"]}')
+    as_json, host = opts["json"], opts["host"]
 
     base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    meta = load_meta()
+    reconcile(meta, base)
     clients = inbound_in(base)["settings"]["clients"]
+
+    def out(user_rows, text):
+        if as_json:
+            print(json.dumps(user_rows, ensure_ascii=False, indent=2))
+        else:
+            print(text)
+
     if action == "list":
-        users = users_report(base, host)
+        users = users_report(base, host, meta)
         if as_json:
             print(json.dumps(users, ensure_ascii=False, indent=2))
             return
-        print(f'{"ИМЯ":<24} {"ПРИНЯТО":>14} {"ОТДАНО":>14}')
+        print(f'{"ИМЯ":<24} {"ВСЕГО":>11} {"ЛИМИТ":>11} {"ДО":<17} СОСТОЯНИЕ')
         for u in users:
-            print(f'{u["name"]:<24} {str(u["uplink"] if u["uplink"] is not None else "—"):>14} '
-                  f'{str(u["downlink"] if u["downlink"] is not None else "—"):>14}')
+            state = LIMIT_REASONS.get(u["disabled"], "отключён") if u["disabled"] else "активен"
+            print(f'{u["name"]:<24} {fmt_gb(u["total"]):>11} {fmt_gb(u["limit"]):>11} '
+                  f'{fmt_date(u["expires"]):<17} {state}')
         return
-    if action not in ("add", "link", "remove") or not name:
+
+    if action == "enforce":
+        if name:
+            die(usage)
+        collected = collect_traffic(meta)
+        off, on = enforce(base, meta, time.time())
+        with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
+            commit_users(base, ex, meta, added=on, removed=[c for c, _ in off])
+        if as_json:
+            print(json.dumps({"collected": collected,
+                              "disabled": [{"name": client_name(c), "reason": r} for c, r in off],
+                              "enabled": [client_name(c) for c in on]}, ensure_ascii=False, indent=2))
+        else:
+            for c, r in off:
+                print(f"Отключён «{client_name(c)}»: {LIMIT_REASONS[r]}.")
+            for c in on:
+                print(f"Снова включён «{client_name(c)}».")
+        return
+
+    if action not in ("add", "link", "remove", "limit", "disable", "enable", "reset") or not name:
         die(usage)
     clean = clean_name(name)
     if not clean:
         die("в имени нужны латинские буквы, цифры, - или _")
     found = next((c for c in clients if client_name(c) == clean), None)
+    m = meta["users"].get(clean)
+    off_client = m.get("client") if m and m.get("disabled") else None
     # Серверы, поставленные до появления изменений на лету: включаем сервисы API.
     # Это меняет настройки API, поэтому в этот раз Xray всё равно перезапустится.
     upgrade = upgrade_api(base, ("HandlerService",))
 
+    def row():
+        # Файл ограничений перечитывается: перезапуск Xray мог дописать в него счётчики.
+        return next(u for u in users_report(base, host) if u["name"] == clean)
+
+    def change(added=(), removed=()):
+        with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
+            if upgrade:
+                save_meta(meta)
+                apply(base, ex)
+                return True
+            return commit_users(base, ex, meta, added, removed)
+
     if action == "link":
-        if not found:
+        if not found and not off_client:
             die(f"пользователь «{clean}» не найден")
-        print(next(u["link"] for u in users_report(base, host) if u["name"] == clean)
-              or die("не удалось получить ссылку: укажите --host и проверьте xray"))
+        print(row()["link"] or die("не удалось получить ссылку: укажите --host и проверьте xray"))
     elif action == "add":
-        if found:
+        if found or m and m.get("client"):
             die(f"пользователь «{clean}» уже есть")
         client = {"id": str(uuid.uuid4()), "flow": "xtls-rprx-vision", "email": clean}
         clients.append(client)
-        with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
-            if upgrade:
-                apply(base, ex)
-                restarted = True
-            else:
-                restarted = apply_user_change(base, ex, "add", client)
-        user = next(u for u in users_report(base, host) if u["name"] == clean)
+        meta["users"].pop(clean, None)  # старый счётчик удалённого тёзки
+        restarted = change(added=[client])
+        user = row()
         user["restarted"] = restarted
         if as_json:
             print(json.dumps(user, ensure_ascii=False, indent=2))
         else:
             print(f"Добавлен пользователь «{clean}».")
             print(user["link"] or "Ссылку получить не удалось: укажите --host и проверьте xray.")
-    else:
-        if not found:
+    elif action == "remove":
+        if not found and not off_client:
             die(f"пользователь «{clean}» не найден")
-        if len(clients) == 1:
+        if found and len(clients) == 1:
             die("нельзя удалить последнего пользователя: к серверу некому будет подключиться")
-        clients.remove(found)
-        if upgrade:
-            apply(base, ex)
+        meta["users"].pop(clean, None)
+        if found:
+            clients.remove(found)
+            change(removed=[found])
         else:
-            apply_user_change(base, ex, "remove", found)
+            save_meta(meta)
         print(f"Удалён пользователь «{clean}».")
+    else:
+        if not found and not off_client:
+            die(f"пользователь «{clean}» не найден")
+        m = meta["users"].setdefault(clean, {})
+        collect_traffic(meta)  # лимит сравнивается со свежим трафиком
+        now = time.time()
+        added, removed = [], []
+        if action == "disable":
+            if not found:
+                die(f"пользователь «{clean}» уже отключён")
+            disable_client(base, meta, found, "manual")
+            removed.append(found)
+        elif action == "enable" and found:
+            die(f"пользователь «{clean}» и так включён")
+        elif action == "limit":
+            if sum(bool(x) for x in (opts["days"], opts["until"], opts["no_expiry"])) > 1:
+                die("укажите что-то одно: --days, --until или --no-expiry")
+            if opts["traffic"] and opts["no_traffic"]:
+                die("укажите что-то одно: --traffic или --no-traffic")
+            if opts["days"]:
+                if not re.fullmatch(r"\d{1,4}", opts["days"]) or int(opts["days"]) < 1:
+                    die("--days: число дней от 1 до 9999")
+                m["expires"] = int(now + int(opts["days"]) * 86400)
+            elif opts["until"]:
+                m["expires"] = parse_until(opts["until"])
+            elif opts["no_expiry"]:
+                m.pop("expires", None)
+            if opts["traffic"]:
+                try:
+                    gb = float(opts["traffic"].replace(",", "."))
+                except ValueError:
+                    gb = 0
+                if not 0 < gb <= 1_000_000:
+                    die("--traffic: объём в гигабайтах, больше нуля")
+                m["limit"] = int(gb * GB)
+            elif opts["no_traffic"]:
+                m.pop("limit", None)
+            ensure_cron()
+        elif action == "reset":
+            m["used"] = 0
+        if action != "disable":
+            # Состояние заново по сроку и лимиту: вышел за них — отключается, продлили — включается.
+            # Отключённого вручную включает только enable.
+            reason = limit_reason(m, now)
+            if found and reason:
+                disable_client(base, meta, found, reason)
+                removed.append(found)
+            elif not found and reason:
+                if action == "enable":
+                    die(f"«{clean}» не включён: {LIMIT_REASONS[reason]}. Продлите срок или увеличьте лимит.")
+                if m.get("disabled") != "manual":
+                    m["disabled"] = reason
+            elif not found and (action == "enable" or m.get("disabled") != "manual"):
+                added.append(enable_client(base, meta, clean))
+        change(added, removed)
+        user = row()
+        state = LIMIT_REASONS.get(user["disabled"], "отключён") if user["disabled"] else "активен"
+        out(user, f'«{clean}»: {state}; трафик {fmt_gb(user["total"])} из {fmt_gb(user["limit"])}, '
+                  f'до {fmt_date(user["expires"])}.')
 
 
 def read_file(path):
@@ -1342,11 +1608,18 @@ def migrate_export():
     ib = inbound_in(base)
     rs = ib["streamSettings"]["realitySettings"]
     r = find_rule(base, RULE_DIRECT)
+    meta = load_meta()
+    reconcile(meta, base)
+    off = [(m["client"], m["disabled"]) for m in meta["users"].values() if m.get("disabled") and m.get("client")]
+    clients = [(c, None) for c in ib["settings"]["clients"]] + off
     return {
         "version": MIGRATE_VERSION,
         "mode": "bridge" if base.get("routing", {}).get("balancers") else "simple",
-        "clients": [{"id": c["id"], "email": client_name(c), "flow": c.get("flow", "")}
-                    for c in ib["settings"]["clients"]],
+        "clients": [dict({"id": c["id"], "email": client_name(c), "flow": c.get("flow", "")},
+                         **({"disabled": d} if d else {})) for c, d in clients],
+        # Сроки, лимиты и накопленный трафик; в старых файлах этого ключа нет.
+        "limits": {n: {k: m[k] for k in ("expires", "limit", "used") if m.get(k)}
+                   for n, m in meta["users"].items() if any(m.get(k) for k in ("expires", "limit", "used"))},
         "reality": {"privateKey": rs["privateKey"], "shortIds": rs["shortIds"]},
         "direct": list(r["domain"]) if r else [],
         "exits": exits_list(ex),
@@ -1362,18 +1635,32 @@ def migrate_import(data, keys):
     if not isinstance(data, dict) or data.get("version") != MIGRATE_VERSION:
         die("файл переноса не той версии или повреждён")
     base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    meta = load_meta()
+    reconcile(meta, base)
     ib = inbound_in(base)
     clients = ib["settings"]["clients"]
-    names = {client_name(c) for c in clients}
-    ids = {c["id"] for c in clients}
+    off = [m["client"] for m in meta["users"].values() if m.get("disabled") and m.get("client")]
+    names = {client_name(c) for c in clients + off}
+    ids = {c["id"] for c in clients + off}
     rep = {"added": [], "skipped": [], "keys": False, "direct_added": 0, "exits_added": [], "ignored": []}
+    limits = data.get("limits") or {}
 
     for c in data.get("clients", []):
         name = clean_name(c.get("email", "")) or c["id"][:8]
         if name in names or c["id"] in ids:
             rep["skipped"].append(name)
             continue
-        clients.append({"id": c["id"], "flow": c.get("flow") or "xtls-rprx-vision", "email": name})
+        client = {"id": c["id"], "flow": c.get("flow") or "xtls-rprx-vision", "email": name}
+        lim = limits.get(name) or {}
+        m = {k: lim[k] for k in ("expires", "limit", "used") if isinstance(lim.get(k), (int, float))}
+        if c.get("disabled") in LIMIT_REASONS:
+            m.update(client=client, disabled=c["disabled"])
+        else:
+            clients.append(client)
+        if m:
+            meta["users"][name] = m
+        else:
+            meta["users"].pop(name, None)
         names.add(name)
         ids.add(c["id"])
         rep["added"].append(name)
@@ -1410,6 +1697,8 @@ def migrate_import(data, keys):
         if data.get("exits"):
             rep["ignored"].append("выходы: простой сервер выходы не использует")
 
+    if rep["added"]:
+        save_meta(meta)
     if rep["added"] or rep["keys"] or rep["direct_added"] or rep["exits_added"]:
         apply(base, ex)
     return rep
@@ -1446,7 +1735,18 @@ def cmd_migrate(a):
         print("Не перенесено —", note)
 
 
+# Команды, которые меняют конфиг или файл ограничений: выполняются по одной (cron и приложение).
+LOCKED = {"add", "remove", "use", "auto", "direct", "user", "migrate"}
+
+
 def main(a):
+    if a and a[0] in LOCKED:
+        with state_lock():
+            return dispatch(a)
+    return dispatch(a)
+
+
+def dispatch(a):
     if not a or a[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return

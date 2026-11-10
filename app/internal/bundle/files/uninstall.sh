@@ -13,7 +13,7 @@ rm -rf /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
 systemctl daemon-reload
 
 rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray
-rm -f /usr/local/bin/xray /usr/local/bin/exitctl /etc/cron.d/xray-geodata \
+rm -f /usr/local/bin/xray /usr/local/bin/exitctl /etc/cron.d/xray-geodata /etc/cron.d/exitctl-users \
       /root/bridge-info.txt /root/exit-info.txt /root/simple-info.txt
 
 if command -v ufw >/dev/null; then

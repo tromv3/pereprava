@@ -102,6 +102,10 @@ export function RemoveUser(arg1, arg2) {
   return window['go']['main']['App']['RemoveUser'](arg1, arg2);
 }
 
+export function ResetUserTraffic(arg1, arg2) {
+  return window['go']['main']['App']['ResetUserTraffic'](arg1, arg2);
+}
+
 export function RestoreBackup(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['RestoreBackup'](arg1, arg2, arg3, arg4);
 }
@@ -112,6 +116,14 @@ export function SaveServer(arg1) {
 
 export function ScanSNI(arg1, arg2) {
   return window['go']['main']['App']['ScanSNI'](arg1, arg2);
+}
+
+export function SetUserEnabled(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SetUserEnabled'](arg1, arg2, arg3);
+}
+
+export function SetUserLimit(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['SetUserLimit'](arg1, arg2, arg3, arg4);
 }
 
 export function Status(arg1) {

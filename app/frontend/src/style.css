@@ -198,3 +198,6 @@ td.actions button { margin-left: 6px; }
 .notice-bad { color: var(--bad); border-color: var(--bad); }
 .health-list { margin: 6px 0; padding-left: 20px; }
 .health-list li { margin: 2px 0; overflow-wrap: anywhere; }
+tr.off td { color: var(--muted); }
+tr.off td small.fail { color: var(--bad); }
+th { white-space: nowrap; }

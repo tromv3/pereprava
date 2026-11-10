@@ -4,7 +4,8 @@ import contextlib, importlib.machinery, importlib.util, io, json, os, re, shutil
 sys.dont_write_bytecode = True
 exitctl_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "exitctl")
 tmp = tempfile.mkdtemp()
-os.environ.update(XRAY_CONF_DIR=tmp, XRAY_BIN="xray-stub", XRAY_NO_RESTART="1")
+os.environ.update(XRAY_CONF_DIR=tmp, XRAY_BIN="xray-stub", XRAY_NO_RESTART="1",
+                  XRAY_USERS_META=os.path.join(tmp, "users-meta.json"), EXITCTL_CRON=os.path.join(tmp, "cron-exitctl"))
 loader = importlib.machinery.SourceFileLoader("exitctl", exitctl_path)
 spec = importlib.util.spec_from_loader("exitctl", loader)
 ex = importlib.util.module_from_spec(spec)
@@ -33,6 +34,10 @@ def fake_run(cmd, **k):
         r.returncode = mode.get("live_rc", 0)
     elif cmd[0] == "systemctl" and cmd[1:2] == ["restart"]:
         restarts.append(1)
+    elif cmd[1:2] == ["api"] and "-reset" in cmd:
+        # Сбор с обнулением: отдаём накопившееся с прошлого сбора и обнуляем.
+        if mode["api"]: r.stdout = json.dumps(mode.pop("reset_stats", {}))
+        else: r.returncode = 1
     elif cmd[1:2] == ["api"]:
         if mode["api"]: r.stdout = json.dumps(stats)
         else: r.returncode = 1
@@ -431,6 +436,111 @@ ex.resolve_ipv4 = lambda d: []
 expect("cert_report: нет DNS", ex.cert_report("site.example")["error"] == "домен не резолвится")
 for k, v in real.items():
     setattr(ex, k, v)
+
+# --- сроки и лимиты пользователей
+ex.NO_RESTART = False
+mode.update(api=True, test_rc=0, live_rc=0)
+meta_path = os.environ["XRAY_USERS_META"]
+cron_path = os.environ["EXITCTL_CRON"]
+for f in (meta_path, cron_path):
+    if os.path.exists(f): os.remove(f)
+write_base(["StatsService", "HandlerService"])
+open(os.path.join(tmp, "20_exits.json"), "w").write('{"outbounds": []}')
+stats.clear()
+def users():
+    return {u["name"]: u for u in json.loads(cli("user", "list", "--json")[1])}
+def active():
+    return [x["email"] for x in read_base()["inbounds"][0]["settings"]["clients"]]
+def gbs(n):
+    return {"stat": [{"name": "user>>>anna>>>traffic>>>uplink", "value": int(n * ex.GB / 2)},
+                     {"name": "user>>>anna>>>traffic>>>downlink", "value": int(n * ex.GB / 2)}]}
+reset()
+c, o, e = cli("user", "add", "anna", "--json")
+anna_id = json.loads(o)["uuid"] if c == 0 else None
+c, o, e = cli("user", "limit", "anna", "--traffic", "1", "--json")
+u = json.loads(o) if c == 0 else {}
+expect("limit: лимит 1 ГБ записан, пользователь активен", c == 0 and u.get("limit") == ex.GB and u.get("disabled") is None, (o, e))
+expect("limit: cron для enforce поставлен", os.path.exists(cron_path) and "user enforce" in open(cron_path).read())
+mode["reset_stats"] = gbs(1.2); reset()
+c, o, e = cli("user", "enforce", "--json")
+r = json.loads(o) if c == 0 else {}
+expect("enforce: трафик собран, anna отключена без перезапуска", c == 0 and r.get("collected") and r.get("disabled") == [{"name": "anna", "reason": "traffic"}]
+       and "anna" not in active() and not restarts and calls() == ["rmu"], (o, e, calls()))
+u = users()
+expect("list: отключённая видна, причина, трафик и прежняя ссылка", u["anna"]["disabled"] == "traffic" and u["anna"]["total"] >= ex.GB and u["anna"]["uuid"] == anna_id and u["anna"]["link"], u.get("anna"))
+reset()
+c, o, e = cli("user", "enforce", "--json")
+expect("enforce повторно: ничего не меняет", c == 0 and json.loads(o)["disabled"] == [] and json.loads(o)["enabled"] == [] and not api_calls, (o, calls()))
+reset()
+c, o, e = cli("user", "limit", "anna", "--traffic", "2", "--json")
+expect("лимит увеличен: anna снова включена с тем же UUID через adu", c == 0 and "anna" in active() and calls() == ["adu"]
+       and api_calls[0][2]["inbounds"][0]["settings"]["clients"][0]["id"] == anna_id and json.loads(o)["disabled"] is None, (o, e, calls()))
+reset()
+c, o, e = cli("user", "limit", "anna", "--until", "2020-01-01", "--json")
+expect("срок в прошлом: сразу отключена", c == 0 and json.loads(o)["disabled"] == "expired" and "anna" not in active() and calls() == ["rmu"], (o, e))
+c, o, e = cli("user", "limit", "anna", "--days", "30", "--json")
+u = json.loads(o) if c == 0 else {}
+expect("продление на 30 дней: включена", c == 0 and u.get("disabled") is None and 29 * 86400 < u["expires"] - ex.time.time() <= 30 * 86400, (o, e))
+c, o, e = cli("user", "limit", "anna", "--until", "2099-01-02T03:04:05+03:00", "--json")
+expect("--until с поясом", c == 0 and json.loads(o)["expires"] == int(__import__("datetime").datetime.fromisoformat("2099-01-02T03:04:05+03:00").timestamp()), o)
+c, o, e = cli("user", "limit", "anna", "--no-expiry", "--no-traffic", "--json")
+u = json.loads(o) if c == 0 else {}
+expect("сняты срок и лимит", c == 0 and u.get("expires") is None and u.get("limit") is None, o)
+reset()
+c, o, e = cli("user", "disable", "anna", "--json")
+expect("disable: вручную", c == 0 and json.loads(o)["disabled"] == "manual" and "anna" not in active() and calls() == ["rmu"], (o, e))
+expect("disable повторно — ошибка", cli("user", "disable", "anna")[0] == 1)
+c, o, e = cli("user", "limit", "anna", "--traffic", "5", "--json")
+expect("лимит не включает отключённого вручную", c == 0 and json.loads(o)["disabled"] == "manual" and "anna" not in active(), o)
+mode["reset_stats"] = {}
+c, o, e = cli("user", "enforce", "--json")
+expect("enforce не включает отключённого вручную", c == 0 and "anna" not in active(), o)
+reset()
+c, o, e = cli("user", "enable", "anna", "--json")
+expect("enable: включена", c == 0 and json.loads(o)["disabled"] is None and "anna" in active() and calls() == ["adu"], (o, e))
+expect("enable включённого — ошибка", cli("user", "enable", "anna")[0] == 1)
+cli("user", "disable", "anna"); cli("user", "limit", "anna", "--until", "2020-01-01")
+c, o, e = cli("user", "enable", "anna")
+expect("enable при истёкшем сроке — отказ с причиной", c == 1 and "истёк срок" in e and "anna" not in active(), (o, e))
+cli("user", "limit", "anna", "--no-expiry")
+expect("после снятия срока всё ещё отключена вручную", users()["anna"]["disabled"] == "manual" and "anna" not in active(), users()["anna"])
+cli("user", "enable", "anna")
+c, o, e = cli("user", "reset", "anna", "--json")
+expect("reset: трафик обнулён", c == 0 and json.loads(o)["total"] == 0, o)
+c, o, e = cli("user", "list")
+expect("list текстом: колонки срока и состояния", c == 0 and "СОСТОЯНИЕ" in o and "активен" in o, o)
+# Сорванное изменение: в файле ограничений отключена, а в конфиге есть — считается активной
+m = json.load(open(meta_path)); m["users"]["anna"].update(disabled="traffic", client={"id": anna_id, "email": "anna"})
+open(meta_path, "w").write(json.dumps(m))
+expect("reconcile: есть в конфиге — значит активна", users()["anna"]["disabled"] is None and list(users()).count("anna") == 1)
+# Перенос с ограничениями
+cli("user", "add", "boris"); cli("user", "limit", "boris", "--traffic", "3"); cli("user", "limit", "boris", "--days", "10"); cli("user", "disable", "anna")
+c, o, e = cli("migrate", "export")
+exp2 = json.loads(o) if c == 0 else {}
+expect("export: отключённая в списке с причиной, ограничения boris", any(x["email"] == "anna" and x.get("disabled") == "manual" for x in exp2.get("clients", []))
+       and exp2.get("limits", {}).get("boris", {}).get("limit") == 3 * ex.GB, exp2.get("limits"))
+mig2 = os.path.join(tmp, "m2.json"); open(mig2, "w").write(o)
+write_base(["StatsService", "HandlerService"]); os.remove(meta_path)
+c, o, e = cli("migrate", "import", mig2, "--json")
+u = users()
+expect("import: отключённая осталась отключённой, лимиты перенесены", c == 0 and u["anna"]["disabled"] == "manual" and "anna" not in active()
+       and u["boris"]["limit"] == 3 * ex.GB and u["boris"]["expires"] and "boris" in active(), (o, e, u))
+c, o, e = cli("user", "remove", "anna")
+expect("remove отключённой: исчезает из списка и файла", c == 0 and "anna" not in users() and "anna" not in json.load(open(meta_path))["users"], (o, e))
+for bad in (["--days", "0"], ["--until", "31.12.2026"], ["--days", "3", "--until", "2030-01-01"], ["--traffic", "-1"],
+            ["--traffic", "1", "--no-traffic"], ["--until", "2030-01-01T10:00:00"]):
+    expect(f"limit: неверно {bad}", cli("user", "limit", "boris", *bad)[0] == 1)
+expect("limit: нет такого", cli("user", "limit", "nobody", "--days", "1")[0] == 1)
+# Перезапуск Xray забирает счётчики в накопленный трафик
+b = read_base(); b.pop("api"); open(os.path.join(tmp, "00_base.json"), "w").write(json.dumps(b)); reset()
+before_total = users()["boris"]["total"]
+mode["reset_stats"] = {"stat": [{"name": "user>>>boris>>>traffic>>>uplink", "value": 700}]}
+c, o, e = cli("user", "add", "carl")
+expect("перезапуск: счётчики сохранены до него", c == 0 and restarts and users()["boris"]["total"] == before_total + 700, (o, e, users()["boris"]))
+mode["api"] = False
+c, o, e = cli("user", "enforce", "--json")
+expect("enforce без API: collected false, без ошибок", c == 0 and json.loads(o)["collected"] is False, (o, e))
+mode["api"] = True
 
 shutil.rmtree(tmp, ignore_errors=True)
 print("Всего:", len(res), "ошибок:", res.count(False))

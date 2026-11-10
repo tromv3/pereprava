@@ -863,6 +863,51 @@ func (a *App) RemoveUser(id, name string) error {
 	return nil
 }
 
+// SetUserLimit задаёт срок доступа и лимит трафика. until — ISO-время с поясом или "" (без срока),
+// trafficGB <= 0 — без лимита. Пользователь, вышедший за них, сразу отключается, а продлённый — включается.
+// Срок и лимит проверяет cron на сервере (exitctl user enforce), поэтому сначала ставится exitctl из приложения:
+// на серверах, настроенных старыми версиями, установленный exitctl этой команды не знает.
+func (a *App) SetUserLimit(id, name, until string, trafficGB float64) (any, error) {
+	if err := a.UpdateTool(id); err != nil {
+		return nil, err
+	}
+	args := []string{"user", "limit", name, "--json"}
+	if until = strings.TrimSpace(until); until == "" {
+		args = append(args, "--no-expiry")
+	} else {
+		args = append(args, "--until", until)
+	}
+	if trafficGB > 0 {
+		args = append(args, "--traffic", strconv.FormatFloat(trafficGB, 'f', -1, 64))
+	} else {
+		args = append(args, "--no-traffic")
+	}
+	return a.userTool(id, args...)
+}
+
+// SetUserEnabled отключает или включает пользователя вручную; ссылка при этом не меняется.
+func (a *App) SetUserEnabled(id, name string, enabled bool) (any, error) {
+	action := "disable"
+	if enabled {
+		action = "enable"
+	}
+	return a.userTool(id, "user", action, name, "--json")
+}
+
+// ResetUserTraffic обнуляет накопленный трафик пользователя: например, с начала нового месяца.
+func (a *App) ResetUserTraffic(id, name string) (any, error) {
+	return a.userTool(id, "user", "reset", name, "--json")
+}
+
+// userTool вызывает exitctl user ... с адресом сервера для ссылок.
+func (a *App) userTool(id string, args ...string) (any, error) {
+	srv, err := a.store.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	return a.tool(id, false, append(args, "--host", srv.Host)...)
+}
+
 // QRCode рисует ссылку как PNG в data-URL. Работает локально, ссылка никуда не отправляется.
 func (a *App) QRCode(text string) (string, error) {
 	png, err := qrcode.Encode(text, qrcode.Medium, 320)

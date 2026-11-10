@@ -93,9 +93,15 @@ xray run -test -confdir "$DIR" >/dev/null
 systemctl enable xray >/dev/null 2>&1
 systemctl restart xray
 
+# Учёт трафика, сроки и лимиты пользователей: каждые 5 минут (exitctl user enforce)
+cat > /etc/cron.d/exitctl-users <<'EOF'
+# exitctl: учёт трафика, сроки и лимиты пользователей
+*/5 * * * * root /usr/local/bin/exitctl user enforce >/dev/null 2>&1
+EOF
+
 # Еженедельное обновление списков geosite/geoip (понедельник, 04:00)
 cat > /etc/cron.d/xray-geodata <<'EOF'
-0 4 * * 1 root bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata >/dev/null 2>&1 && systemctl restart xray
+0 4 * * 1 root bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata >/dev/null 2>&1 && { /usr/local/bin/exitctl user enforce >/dev/null 2>&1; systemctl restart xray; }
 EOF
 
 ufw allow "${SSH_PORT:-22}/tcp" >/dev/null

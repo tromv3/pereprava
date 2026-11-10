@@ -27,6 +27,8 @@ if ! "$BIN.new" run -test "${TEST[@]}" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Счётчики трафика живут до перезапуска Xray: сохраняем их в учёт exitctl (на выходе его нет).
+[ -x /usr/local/bin/exitctl ] && [ -f /usr/local/etc/xray/conf.d/00_base.json ] && /usr/local/bin/exitctl user enforce >/dev/null 2>&1 || true
 cp -p "$BIN" "$BIN.bak"
 mv "$BIN.new" "$BIN"
 systemctl restart xray

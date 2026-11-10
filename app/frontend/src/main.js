@@ -2,7 +2,8 @@ import './style.css';
 import {
   AddDirect, AddExit, AddUser, AllowBridgeOnExit, BackupServer, ChooseBackupOpen, ChooseBackupSave, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Health, Install, ListExits,
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
-  InspectBackup, ListDirect, MigrateUsers, RemoveDirect, RestoreBackup, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
+  InspectBackup, ListDirect, MigrateUsers, RemoveDirect, ResetUserTraffic, RestoreBackup, SetUserEnabled, SetUserLimit,
+  UpdateGeodata, UpdateTool, UpdateXray, UseExit,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
 
@@ -483,7 +484,7 @@ function updateHelp(st) {
   const ex = st.mode === 'exit';
   return helpBlock('Что меняется при обновлении', [
     'Ссылки, ключи, пользователи и настройки при обновлениях не меняются: пользователям ничего делать не нужно.',
-    `«Обновить Xray» перезапускает Xray: связь у всех обрывается на пару секунд, клиенты переподключаются сами${ex ? '' : ', счётчики трафика начинаются с нуля'}. Если новая версия не примет настройки или не запустится, вернётся старая.`,
+    `«Обновить Xray» перезапускает Xray: связь у всех обрывается на пару секунд, клиенты переподключаются сами${ex ? '' : ', накопленный трафик пользователей сохраняется'}. Если новая версия не примет настройки или не запустится, вернётся старая.`,
     !ex && '«Обновить списки сайтов» меняет только то, какие сайты сервер открывает напрямую. Xray перезапускается так же, с коротким обрывом. Если Xray не примет новые списки, останутся старые.',
     !ex && '«Обновить exitctl на сервере» заменяет только программу для консоли сервера. Xray не перезапускается, клиенты ничего не замечают.',
     ex && 'Если через этот выход ходит мост, во время перезапуска мост ненадолго переключится на другой живой выход или подождёт этот.',
@@ -582,7 +583,7 @@ function directPanel(server) {
   load().catch((e) => { list.replaceChildren(); showError(e); });
   return h('div', { class: 'panel' }, h('h3', {}, 'Сайты напрямую'), errorBox,
     h('p', { class: 'hint', style: 'margin-bottom:8px' },
-      'Эти домены мост открывает сам, не через выход: например, российский сайт, которого нет во встроенных списках, или сайт, который не пускает зарубежные адреса. Поддомены входят автоматически. Изменение списка коротко перезапускает Xray.'),
+      'Эти домены мост открывает сам, не через выход: например, российский сайт, которого нет во встроенных списках, или сайт, который не пускает зарубежные адреса. Поддомены входят автоматически. Список меняется без перезапуска Xray.'),
     h('div', { class: 'row', style: 'margin-bottom:10px' }, input, addBtn), list);
 }
 
@@ -876,6 +877,69 @@ async function showLink(user) {
   ]);
 }
 
+const DISABLED_NAMES = { expired: 'истёк срок', traffic: 'исчерпан трафик', manual: 'отключён вручную' };
+
+// Дата из <input type=date> как конец этого дня по времени компьютера, с поясом: сервер может жить в другом.
+function endOfDayISO(date) {
+  const off = -new Date(`${date}T23:59:59`).getTimezoneOffset();
+  const pad = (n) => String(Math.floor(Math.abs(n))).padStart(2, '0');
+  return `${date}T23:59:59${off >= 0 ? '+' : '-'}${pad(off / 60)}:${pad(off % 60)}`;
+}
+
+function dateInputValue(ts) {
+  const d = new Date(ts * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function limitsDialog(server, u) {
+  return modal((close) => {
+    const err = h('p', { class: 'fail', style: 'min-height:1.2em;margin:6px 0 0' });
+    const date = h('input', { type: 'date', value: u.expires ? dateInputValue(u.expires) : '' });
+    const noDate = h('input', { type: 'checkbox', checked: !u.expires, style: 'width:auto;margin-right:6px' });
+    const gb = h('input', { type: 'number', min: '0.1', step: '0.1', value: u.limit ? +(u.limit / 1024 ** 3).toFixed(2) : '' });
+    const noLimit = h('input', { type: 'checkbox', checked: !u.limit, style: 'width:auto;margin-right:6px' });
+    const sync = () => { date.disabled = noDate.checked; gb.disabled = noLimit.checked; };
+    noDate.addEventListener('change', sync);
+    noLimit.addEventListener('change', sync);
+    sync();
+    const quick = (days) => h('button', { onclick: () => {
+      const d = new Date(Date.now() + days * 86400000);
+      date.value = dateInputValue(d / 1000);
+      noDate.checked = false;
+      sync();
+    } }, `+${days} дн.`);
+    const run = async (fn) => {
+      err.textContent = '';
+      try {
+        await fn();
+        close(true);
+      } catch (e) {
+        err.textContent = msg(e);
+      }
+    };
+    const save = () => {
+      if (!noDate.checked && !date.value) { err.textContent = 'Выберите дату или отметьте «Без срока».'; return; }
+      const amount = noLimit.checked ? 0 : Number(gb.value);
+      if (!noLimit.checked && !(amount > 0)) { err.textContent = 'Укажите лимит в гигабайтах или отметьте «Без лимита».'; return; }
+      run(() => SetUserLimit(server.id, u.name, noDate.checked ? '' : endOfDayISO(date.value), amount));
+    };
+    return [
+      h('h3', {}, `Ограничения: ${u.name}`),
+      h('p', { class: 'hint' }, 'Сервер проверяет их каждые 5 минут. Вышедший за срок или лимит отключается, но его ссылка сохраняется: после продления она снова работает.'),
+      h('label', { class: 'field' }, h('span', {}, 'Доступ до (включительно)'),
+        h('div', { class: 'row' }, date, quick(30), quick(90))),
+      h('label', { style: 'cursor:pointer;display:block;margin-bottom:10px' }, noDate, 'Без срока'),
+      h('label', { class: 'field' }, h('span', {}, `Лимит трафика, ГБ (израсходовано ${formatBytes(u.total)})`), gb),
+      h('label', { style: 'cursor:pointer;display:block' }, noLimit, 'Без лимита'),
+      err,
+      h('div', { class: 'modal-actions' },
+        h('button', { onclick: () => run(() => ResetUserTraffic(server.id, u.name)) }, 'Обнулить трафик'),
+        h('button', { onclick: () => close(false) }, 'Отмена'),
+        h('button', { class: 'primary', onclick: save }, 'Сохранить')),
+    ];
+  });
+}
+
 function usersPanel(server) {
   const list = h('div', {}, h('p', { class: 'hint' }, 'Загружаю пользователей...'));
   const errorBox = h('div');
@@ -886,15 +950,39 @@ function usersPanel(server) {
   async function load() {
     try {
       const users = await ListUsers(server.id);
+      const activeCount = users.filter((u) => !u.disabled).length;
       list.replaceChildren(h('table', {},
-        h('thead', {}, h('tr', {}, ['Имя', 'Принято', 'Отдано', ''].map((t) => h('th', {}, t)))),
-        h('tbody', {}, users.map((u) => h('tr', {},
-          h('td', {}, u.name), h('td', {}, formatBytes(u.uplink)), h('td', {}, formatBytes(u.downlink)),
+        h('thead', {}, h('tr', {}, ['Имя', 'Трафик', 'Доступ до', ''].map((t) => h('th', {}, t)))),
+        h('tbody', {}, users.map((u) => h('tr', { class: u.disabled ? 'off' : null },
+          h('td', {}, u.name, u.disabled ? h('small', { class: 'fail', style: 'display:block' }, DISABLED_NAMES[u.disabled] || 'отключён') : null),
+          h('td', { class: u.limit && u.total >= u.limit ? 'fail' : null },
+            formatBytes(u.total), u.limit ? ` из ${formatBytes(u.limit)}` : ''),
+          h('td', { class: u.expires && u.expires * 1000 < Date.now() ? 'fail' : null },
+            u.expires ? new Date(u.expires * 1000).toLocaleDateString('ru-RU') : '—'),
           h('td', { class: 'actions' },
             h('button', { disabled: !u.link, onclick: () => showLink(u) }, 'Ссылка и QR'),
-            h('button', { class: 'danger', disabled: users.length === 1, onclick: () => remove(u) }, 'Удалить')))))));
+            h('button', { onclick: async () => { if (await limitsDialog(server, u)) load(); } }, 'Ограничения'),
+            u.disabled
+              ? h('button', { onclick: () => toggle(u, true) }, 'Включить')
+              : h('button', { onclick: () => toggle(u, false) }, 'Отключить'),
+            h('button', { class: 'danger', disabled: !u.disabled && activeCount === 1, onclick: () => remove(u) }, 'Удалить')))))));
     } catch (e) {
       list.replaceChildren();
+      showError(e);
+    }
+  }
+
+  async function toggle(u, enabled) {
+    if (!enabled) {
+      const ok = await confirmDialog('Отключить пользователя?',
+        `«${u.name}» не сможет подключиться, пока его не включат снова. Ссылка не изменится.`, 'Отключить');
+      if (!ok) return;
+    }
+    errorBox.replaceChildren();
+    try {
+      await SetUserEnabled(server.id, u.name, enabled);
+      await load();
+    } catch (e) {
       showError(e);
     }
   }
@@ -930,7 +1018,7 @@ function usersPanel(server) {
   load();
   return h('div', { class: 'panel' }, h('h3', {}, 'Пользователи'), errorBox,
     h('div', { class: 'row', style: 'margin-bottom:10px' }, nameInput, addBtn),
-    h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'Пользователи добавляются и удаляются без обрыва связи. На серверах, настроенных старой версией, первое такое изменение один раз перезапустит Xray. Трафик считается с последнего перезапуска Xray.'),
+    h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'Пользователи добавляются, отключаются и удаляются без обрыва связи у остальных. На серверах, настроенных старой версией, первое такое изменение один раз перезапустит Xray. Трафик считается нарастающим итогом: сервер переносит счётчики Xray в учёт каждые 5 минут и перед каждым перезапуском. Срок и лимит тоже проверяются каждые 5 минут.'),
     list);
 }
 

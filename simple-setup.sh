@@ -91,6 +91,12 @@ xray run -test -confdir "$DIR" >/dev/null
 systemctl enable xray >/dev/null 2>&1
 systemctl restart xray
 
+# Учёт трафика, сроки и лимиты пользователей: каждые 5 минут (exitctl user enforce)
+cat > /etc/cron.d/exitctl-users <<'EOF'
+# exitctl: учёт трафика, сроки и лимиты пользователей
+*/5 * * * * root /usr/local/bin/exitctl user enforce >/dev/null 2>&1
+EOF
+
 ufw allow "$SSH_PORT/tcp" >/dev/null
 ufw allow $PORT/tcp >/dev/null
 ufw --force enable >/dev/null
