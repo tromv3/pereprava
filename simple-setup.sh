@@ -56,7 +56,7 @@ cat > "$DIR/00_base.json" <<EOF
 {
   "log": { "loglevel": "warning", "access": "none" },
   "stats": {},
-  "api": { "tag": "api", "listen": "127.0.0.1:$API_PORT", "services": ["HandlerService", "StatsService"] },
+  "api": { "tag": "api", "listen": "127.0.0.1:$API_PORT", "services": ["HandlerService", "StatsService", "RoutingService"] },
   "policy": { "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true } } },
   "inbounds": [{
     "tag": "in", "port": $PORT, "protocol": "vless",

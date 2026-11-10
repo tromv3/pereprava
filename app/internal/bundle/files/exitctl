@@ -38,6 +38,7 @@ PREFIX = "exit-"
 RULE_EXITS = "to-exits"
 RULE_DIRECT = "user-direct"
 API_SERVER = "127.0.0.1:10085"
+LIVE_SERVICES = ("HandlerService", "RoutingService")  # пользователи, выходы и правила без перезапуска
 SNI_PORT = 443
 SNI_TIMEOUT = 6
 SNI_MAX_RTT_MS = 30
@@ -154,10 +155,32 @@ def apply(base, ex):
     restart_xray()
 
 
+def live_ok(base, needed):
+    """Можно ли передать изменение запущенному Xray через API: нужные сервисы включены и Xray работает."""
+    services = (base.get("api") or {}).get("services") or []
+    return all(s in services for s in needed) and run_text("systemctl", "is-active", "xray") == "active"
+
+
 def live_users_ok(base):
     """Можно ли менять пользователей через API, без перезапуска Xray."""
-    services = (base.get("api") or {}).get("services") or []
-    return "HandlerService" in services and run_text("systemctl", "is-active", "xray") == "active"
+    return live_ok(base, ("HandlerService",))
+
+
+def upgrade_api(base, needed):
+    """Серверы, поставленные до появления изменений на лету: включить сервисы API.
+
+    Если в api нет чего-то из needed, добавляются все сервисы из LIVE_SERVICES, и функция
+    возвращает True: настройки API изменились, поэтому в этот раз Xray всё равно перезапустится.
+    Без api (простой режим старых версий) ничего не меняется.
+    """
+    api = base.get("api")
+    if not api:
+        return False
+    services = api.setdefault("services", [])
+    if all(s in services for s in needed):
+        return False
+    services.extend(s for s in LIVE_SERVICES if s not in services)
+    return True
 
 
 def api_call(*args):
@@ -167,6 +190,47 @@ def api_call(*args):
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode == 0
+
+
+def api_json(cmd, data):
+    """Вызов API с JSON во временном файле: так xray api принимает конфиги."""
+    fd, path = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        return api_call(cmd, path)
+    finally:
+        os.remove(path)
+
+
+def apply_routing_change(base, ex, old_ex):
+    """Записать конфиг и передать запущенному Xray изменения выходов и правил. True, если Xray перезапущен.
+
+    Выходы добавляются и удаляются через HandlerService (ado, rmo): балансировщик и observatory
+    сами видят новый набор по префиксу exit-. Правила и балансировщик целиком заменяются через
+    RoutingService (adrules без -append). Порядок: сначала новые выходы, затем правила, которые
+    могут на них ссылаться, и только потом удаление старых. Если API нет или он отказал — перезапуск,
+    конфиг на диске при этом уже новый.
+    """
+    if upgrade_api(base, LIVE_SERVICES) or not live_ok(base, LIVE_SERVICES):
+        apply(base, ex)
+        return True
+    write_and_test(base, ex)
+    old = {o["tag"]: o for o in exits_list(old_ex)}
+    new = {o["tag"]: o for o in exits_list(ex)}
+    changed = [t for t in new if t in old and new[t] != old[t]]
+    added = [new[t] for t in new if t not in old or t in changed]
+    gone = [t for t in old if t not in new]
+    ok = (all(api_call("rmo", t) for t in changed)
+          and (not added or api_json("ado", {"outbounds": added}))
+          and api_json("adrules", {"routing": base["routing"]})
+          and all(api_call("rmo", t) for t in gone))
+    if ok:
+        print("Изменение применено без перезапуска Xray.")
+        return False
+    print("Не удалось применить изменение на лету, перезапускаю Xray.")
+    restart_xray()
+    return True
 
 
 def apply_user_change(base, ex, action, client):
@@ -306,12 +370,13 @@ def cmd_list(as_json=False):
 def cmd_add(link, name=None):
     base, ex = load(BASE), load(EXITS, {"outbounds": []})
     ex.setdefault("outbounds", [])
+    old_ex = json.loads(json.dumps(ex))
     o = parse_vless(link, name)
     if any(x.get("tag") == o["tag"] for x in ex["outbounds"]):
         die(f'выход «{o["tag"][len(PREFIX):]}» уже есть. Удалите его или укажите другое имя.')
     ex["outbounds"].append(o)
     sync_fallback(base, ex)
-    apply(base, ex)
+    apply_routing_change(base, ex, old_ex)
     a, p, t = info(o)
     print(f'Добавлен выход «{o["tag"][len(PREFIX):]}»: {a}:{p} ({t})')
 
@@ -319,6 +384,7 @@ def cmd_add(link, name=None):
 def cmd_remove(name):
     base, ex = load(BASE), load(EXITS, {"outbounds": []})
     tag = PREFIX + clean_name(name)
+    old_ex = json.loads(json.dumps(ex))
     before = len(ex.get("outbounds", []))
     ex["outbounds"] = [o for o in ex.get("outbounds", []) if o.get("tag") != tag]
     if len(ex["outbounds"]) == before:
@@ -329,7 +395,7 @@ def cmd_remove(name):
         r["balancerTag"] = "exits"
         print("Удалённый выход был закреплён — включён режим авто.")
     sync_fallback(base, ex)
-    apply(base, ex)
+    apply_routing_change(base, ex, old_ex)
     print(f"Удалён выход «{clean_name(name)}».")
     if not exits_list(ex):
         print("Внимание: выходов не осталось, зарубежные сайты работать не будут.")
@@ -343,7 +409,7 @@ def cmd_use(name):
     r = find_rule(base, RULE_EXITS) or die("в 00_base.json нет правила to-exits")
     r.pop("balancerTag", None)
     r["outboundTag"] = tag
-    apply(base, ex)
+    apply_routing_change(base, ex, ex)
     print(f"Весь трафик теперь идёт через «{clean_name(name)}».")
 
 
@@ -353,7 +419,7 @@ def cmd_auto():
     r.pop("outboundTag", None)
     r["balancerTag"] = "exits"
     sync_fallback(base, ex)
-    apply(base, ex)
+    apply_routing_change(base, ex, ex)
     print("Включён автовыбор самого быстрого живого выхода.")
 
 
@@ -410,7 +476,7 @@ def cmd_direct(action, domain=None, as_json=False):
         rules.remove(r)
     if doms:
         rules.insert(0, {"ruleTag": RULE_DIRECT, "domain": doms, "outboundTag": "direct"})
-    apply(base, ex)
+    apply_routing_change(base, ex, ex)
     print(("Добавлен" if action == "add" else "Удалён") + f" {d[7:]}")
 
 
@@ -982,10 +1048,9 @@ def cmd_user(a):
     if not clean:
         die("в имени нужны латинские буквы, цифры, - или _")
     found = next((c for c in clients if client_name(c) == clean), None)
-    # Серверы, поставленные до появления изменений на лету: включаем HandlerService.
+    # Серверы, поставленные до появления изменений на лету: включаем сервисы API.
     # Это меняет настройки API, поэтому в этот раз Xray всё равно перезапустится.
-    api = base.get("api")
-    upgrade = bool(api) and "HandlerService" not in (api.get("services") or [])
+    upgrade = upgrade_api(base, ("HandlerService",))
 
     if action == "link":
         if not found:
@@ -999,7 +1064,6 @@ def cmd_user(a):
         clients.append(client)
         with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
             if upgrade:
-                api.setdefault("services", []).append("HandlerService")
                 apply(base, ex)
                 restarted = True
             else:
@@ -1018,7 +1082,6 @@ def cmd_user(a):
             die("нельзя удалить последнего пользователя: к серверу некому будет подключиться")
         clients.remove(found)
         if upgrade:
-            api.setdefault("services", []).append("HandlerService")
             apply(base, ex)
         else:
             apply_user_change(base, ex, "remove", found)

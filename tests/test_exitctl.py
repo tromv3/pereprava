@@ -27,8 +27,8 @@ def fake_run(cmd, **k):
         r.returncode = mode["test_rc"]; r.stdout = "bad"
     elif cmd[1:2] == ["x25519"]:
         r.stdout = mode["x25519"]
-    elif cmd[1:2] == ["api"] and cmd[2] in ("adu", "rmu"):
-        payload = json.load(open(cmd[-1])) if cmd[2] == "adu" else None
+    elif cmd[1:2] == ["api"] and cmd[2] in ("adu", "rmu", "ado", "rmo", "adrules"):
+        payload = json.load(open(cmd[-1])) if cmd[2] in ("adu", "ado", "adrules") else None
         api_calls.append((cmd[2], cmd[3:], payload))
         r.returncode = mode.get("live_rc", 0)
     elif cmd[0] == "systemctl" and cmd[1:2] == ["restart"]:
@@ -302,6 +302,59 @@ expect("import: битый файл отклонён", cli("migrate", "import", 
 expect("import: нет файла", cli("migrate", "import", os.path.join(tmp, "nope.json"))[0] == 1)
 expect("import: неизвестный параметр", cli("migrate", "import", mig, "--force")[0] == 1)
 expect("migrate без аргументов", cli("migrate")[0] == 1)
+
+# --- выходы и правила на лету
+def live_bridge(services, exits):
+    b = bridge_base(src_clients, "P", ["aa"])
+    if services is not None:
+        b["api"] = {"tag": "api", "listen": "127.0.0.1:10085", "services": services}
+    put(b, exits)
+def calls():
+    return [x[0] for x in api_calls]
+def link(name):
+    return f"vless://dddd@198.51.100.3:443?type=tcp&security=reality&pbk=PK&sni=s.example&sid=01#{name}"
+exits_path = os.path.join(tmp, "20_exits.json")
+
+live_bridge(None, [exit_us]); reset()
+c, o, e = cli("add", link("de1"))
+expect("выходы без API: перезапуск", c == 0 and restarts and not api_calls, (o, e, api_calls))
+live_bridge(["StatsService", "HandlerService"], [exit_us]); reset()
+c, o, e = cli("add", link("de1"))
+expect("выходы, старый API: RoutingService включён, перезапуск", c == 0 and "RoutingService" in read_base()["api"]["services"] and restarts and not api_calls, (o, e))
+reset()
+c, o, e = cli("add", link("de2"))
+expect("add на лету: ado, затем adrules, без перезапуска", c == 0 and not restarts and calls() == ["ado", "adrules"] and "без перезапуска" in o, (o, e, calls()))
+expect("add: в ado только новый выход", [x["tag"] for x in api_calls[0][2]["outbounds"]] == ["exit-de2"] if api_calls else False)
+expect("add: в adrules вся маршрутизация из конфига", api_calls[1][2] == {"routing": read_base()["routing"]} if len(api_calls) > 1 else False)
+expect("add: временные файлы удалены", all(not os.path.exists(x[1][-1]) for x in api_calls))
+reset()
+c, o, e = cli("use", "de2")
+expect("use на лету: только adrules с outboundTag", c == 0 and not restarts and calls() == ["adrules"] and api_calls[0][2]["routing"]["rules"][-1].get("outboundTag") == "exit-de2", (o, e, calls()))
+reset()
+c, o, e = cli("remove", "de2")
+expect("remove закреплённого: сначала правила с балансировщиком, потом rmo", c == 0 and not restarts and calls() == ["adrules", "rmo"]
+       and api_calls[0][2]["routing"]["rules"][-1].get("balancerTag") == "exits" and api_calls[1][1][-1] == "exit-de2", (o, e, calls()))
+reset()
+c, o, e = cli("auto")
+expect("auto на лету", c == 0 and not restarts and calls() == ["adrules"], (o, e, calls()))
+reset()
+c, o, e = cli("direct", "add", "example.ru")
+expect("direct на лету: правило user-direct первым", c == 0 and not restarts and calls() == ["adrules"] and api_calls[0][2]["routing"]["rules"][0]["ruleTag"] == "user-direct", (o, e, calls()))
+b_now, ex_now = read_base(), json.load(open(exits_path))
+old_ex = json.loads(json.dumps(ex_now))
+ex_now["outbounds"][0]["settings"]["vnext"][0]["port"] = 8443
+reset()
+with contextlib.redirect_stdout(io.StringIO()):
+    restarted = ex.apply_routing_change(b_now, ex_now, old_ex)
+expect("изменённый выход: rmo, ado, adrules", restarted is False and calls() == ["rmo", "ado", "adrules"], calls())
+reset(); mode["live_rc"] = 1
+c, o, e = cli("add", link("de3"))
+expect("API выходов отказал: перезапуск", c == 0 and restarts and "de3" in open(exits_path).read(), (o, e))
+mode["live_rc"] = 0
+reset(); before = open(exits_path).read(); mode["test_rc"] = 1
+c, o, e = cli("add", link("de4"))
+expect("провал проверки выходов: откат, ни API, ни перезапуска", c == 1 and not api_calls and not restarts and open(exits_path).read() == before, (o, e))
+mode["test_rc"] = 0
 
 shutil.rmtree(tmp, ignore_errors=True)
 print("Всего:", len(res), "ошибок:", res.count(False))
