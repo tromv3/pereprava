@@ -606,6 +606,48 @@ expect("builtin текстом", c == 0 and "Домены:" in o and "domain:ru"
 put(json.loads(json.dumps(base)), [])
 expect("builtin на простом сервере — отказ", cli("direct", "builtin")[0] == 1)
 
+# --- выход и для клиентов: exitctl exit open
+ex.NO_RESTART = False
+mode.update(api=True, test_rc=0, live_rc=0)
+ex.DROPIN = os.path.join(tmp, "dropin", "99-confdir.conf")
+ex.INSTALLED_TOOL = os.path.join(tmp, "installed-exitctl")
+for f in (os.path.join(tmp, "00_base.json"), os.path.join(tmp, "20_exits.json"), meta_path):
+    if os.path.exists(f): os.remove(f)
+exit_conf = {"log": {"loglevel": "warning", "access": "none"},
+             "inbounds": [{"port": 443, "protocol": "vless",
+                           "settings": {"clients": [{"id": "eeeeeeee-0000-0000-0000-000000000001", "flow": "xtls-rprx-vision"}], "decryption": "none"},
+                           "streamSettings": {"network": "tcp", "security": "reality",
+                                              "realitySettings": {"dest": "exit.example:443", "serverNames": ["exit.example"],
+                                                                  "privateKey": "EXITPRIV", "shortIds": ["cd34"]}}}],
+             "outbounds": [{"protocol": "freedom"}]}
+open(ex.EXIT_CONF, "w").write(json.dumps(exit_conf))
+expect("status: до открытия — выход", json.loads(cli("status", "--json")[1])["mode"] == "exit")
+mode["test_rc"] = 1
+c, o, e = cli("exit", "open", "--json")
+expect("exit open: Xray не принял — всё убрано, остаётся выход", c == 1 and not os.path.exists(os.path.join(tmp, "00_base.json"))
+       and not os.path.exists(ex.DROPIN) and json.loads(cli("status", "--json")[1])["mode"] == "exit", (o, e))
+mode["test_rc"] = 0; reset()
+c, o, e = cli("exit", "open", "--json")
+r = json.loads(o) if c == 0 else {}
+b = read_base() if c == 0 else {}
+ib = b.get("inbounds", [{}])[0]
+expect("exit open: мост стал пользователем bridge", c == 0 and r.get("users") == ["bridge"], (o, e))
+expect("exit open: ключи, порт, SNI и UUID те же", ib.get("tag") == "in" and ib["port"] == 443 and ib["streamSettings"]["realitySettings"]["privateKey"] == "EXITPRIV"
+       and ib["streamSettings"]["realitySettings"]["shortIds"] == ["cd34"] and ib["settings"]["clients"][0]["id"] == "eeeeeeee-0000-0000-0000-000000000001", ib)
+expect("exit open: API и счётчики включены", b.get("api", {}).get("services") == ["HandlerService", "StatsService", "RoutingService"] and "stats" in b)
+expect("exit open: drop-in confdir, cron, exitctl установлен", os.path.exists(ex.DROPIN) and "-confdir" in open(ex.DROPIN).read()
+       and os.path.exists(cron_path) and os.path.exists(ex.INSTALLED_TOOL), ex.DROPIN)
+expect("exit open: конфиг выхода не тронут", json.load(open(ex.EXIT_CONF)) == exit_conf)
+s = json.loads(cli("status", "--json")[1])
+expect("status: простой режим с мостом", s["mode"] == "simple" and s["bridge_user"] is True, s)
+expect("exit open повторно — отказ", cli("exit", "open")[0] == 1)
+for act in (["remove", "bridge"], ["disable", "bridge"], ["limit", "bridge", "--days", "1"]):
+    c, o, e = cli("user", *act)
+    expect(f"bridge защищён: user {act[0]}", c == 1 and "мост" in e, (o, e))
+c, o, e = cli("user", "add", "phone", "--json")
+expect("на открытом выходе добавляются пользователи", c == 0 and {u["name"] for u in json.loads(cli("user", "list", "--json")[1])} == {"bridge", "phone"}, (o, e))
+expect("exit без open — подсказка", cli("exit")[0] == 1)
+
 shutil.rmtree(tmp, ignore_errors=True)
 print("Всего:", len(res), "ошибок:", res.count(False))
 sys.exit(1 if False in res else 0)

@@ -28,6 +28,7 @@
   exitctl user enforce [--json]                    учесть трафик и отключить вышедших за пределы (cron)
   exitctl status [--json]                          состояние сервера и Xray
   exitctl health [--json]                          проблемы сервера: Xray, выходы, сертификат SNI, исходящий трафик (код 1 — есть проблемы)
+  exitctl exit open [--json]                       выход — ещё и для клиентов (на выходе; ссылка моста не меняется)
   exitctl reach <адрес> <порт> [--json]            достаёт ли этот сервер до адреса (код 1 — нет)
   exitctl migrate export                           пользователи, ключи Reality, выходы и сайты напрямую (JSON)
   exitctl migrate import <файл> [--keys] [--json]  добавить их сюда; --keys заменяет ключи Reality
@@ -78,6 +79,8 @@ EGRESS_FOREIGN = ("github.com", "deb.debian.org", "www.google.com", "www.cloudfl
 EGRESS_HOSTS = EGRESS_FOREIGN + ("ya.ru",)
 EXIT_CONF = os.environ.get("XRAY_EXIT_CONF", "/usr/local/etc/xray/config.json")
 INSTALLED_TOOL = os.environ.get("EXITCTL_INSTALLED", "/usr/local/bin/exitctl")
+DROPIN = os.environ.get("EXITCTL_DROPIN", "/etc/systemd/system/xray.service.d/99-confdir.conf")
+BRIDGE_USER = "bridge"  # мост на выходе, открытом для клиентов (exitctl exit open)
 RE_SERVICE = re.compile(
     r"(^|[.-])(mail|smtp|imap|pop3?|mx|ns|dns|ftp|cpanel|whm|webmail|autodiscover|autoconfig"
     r"|panel|admin|billing|vps|vds|srv|server|host|node|test|dev|staging|localhost|cdn|api)\d*([.-]|$)")
@@ -1414,6 +1417,8 @@ def cmd_user(a):
     if not clean:
         die("в имени нужны латинские буквы, цифры, - или _")
     found = next((c for c in clients if client_name(c) == clean), None)
+    if clean == BRIDGE_USER and found and action in ("remove", "disable", "limit"):
+        die(f"«{BRIDGE_USER}» — мост, который ходит через этот выход: без него мост потеряет выход")
     m = meta["users"].get(clean)
     off_client = m.get("client") if m and m.get("disabled") else None
     # Серверы, поставленные до появления изменений на лету: включаем сервисы API.
@@ -1597,7 +1602,7 @@ def status_report():
         },
         "installed": os.path.exists(BASE),
         "tool_sha256": file_sha256(INSTALLED_TOOL),
-        "mode": None, "sni": None, "port": None, "users": None, "exits": None,
+        "mode": None, "sni": None, "port": None, "users": None, "exits": None, "bridge_user": False,
     }
     if rep["installed"]:
         base, ex = load(BASE), load(EXITS, {"outbounds": []})
@@ -1606,6 +1611,8 @@ def status_report():
         rep["sni"] = ib["streamSettings"]["realitySettings"]["serverNames"][0]
         rep["port"] = ib["port"]
         rep["users"] = len(ib["settings"]["clients"])
+        # Выход, открытый для клиентов: простой режим, где один из пользователей — мост.
+        rep["bridge_user"] = any(client_name(c) == BRIDGE_USER for c in ib["settings"]["clients"])
         rep["exits"] = len(exits_list(ex))
     elif os.path.exists(EXIT_CONF):
         # Выход настроен exit-setup.sh: один config.json. Установщик Xray кладёт сюда пустой {}.
@@ -1721,6 +1728,84 @@ def cmd_health(a):
         if not rep["problems"] and not rep["warnings"]:
             print("Всё в порядке.")
     sys.exit(1 if rep["problems"] else 0)
+
+
+def exit_open():
+    """Выход становится и сервером для клиентов: раскладка простого режима с теми же ключами.
+
+    Ключи Reality, порт, SNI и UUID моста сохраняются, так что ссылка на мосту не меняется;
+    мост становится пользователем «bridge». Порт 443 открывается всем. Старый config.json
+    остаётся на месте: если новый конфиг не запустится, Xray возвращается к нему.
+    """
+    if os.path.exists(BASE):
+        die("этот сервер уже настроен как мост или простой сервер")
+    conf = load(EXIT_CONF)
+    try:
+        ib = json.loads(json.dumps(conf["inbounds"][0]))
+        ib["streamSettings"]["realitySettings"]["privateKey"]
+        clients = ib["settings"]["clients"]
+    except (KeyError, IndexError, TypeError):
+        die(f"{EXIT_CONF} не похож на конфиг выхода, поставленного exit-setup.sh")
+    for i, c in enumerate(clients):
+        c["email"] = c.get("email") or (BRIDGE_USER if i == 0 else f"{BRIDGE_USER}{i + 1}")
+    ib["tag"] = "in"
+    ib["sniffing"] = {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}
+    base = {
+        "log": {"loglevel": "warning", "access": "none"},
+        "stats": {},
+        "api": {"tag": "api", "listen": API_SERVER, "services": ["HandlerService", "StatsService", "RoutingService"]},
+        "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}},
+        "inbounds": [ib],
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
+        "routing": {"rules": [{"protocol": ["bittorrent"], "outboundTag": "block"},
+                              {"ip": ["geoip:private"], "outboundTag": "block"}]},
+    }
+    os.makedirs(CONF_DIR, exist_ok=True)
+
+    def undo(msg):
+        for p in (BASE, EXITS, DROPIN):
+            with contextlib.suppress(OSError):
+                os.remove(p)
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+        subprocess.run(["systemctl", "restart", "xray"], capture_output=True)
+        die(msg + " Выход возвращён к прежнему конфигу.")
+
+    save(BASE, base)
+    save(EXITS, {"outbounds": []})
+    test = subprocess.run([XRAY, "run", "-test", "-confdir", CONF_DIR], capture_output=True, text=True)
+    if test.returncode != 0:
+        out = (test.stdout + test.stderr).strip().splitlines()
+        undo("новый конфиг не прошёл проверку:\n  " + "\n  ".join(out[-5:]) + "\n")
+    os.makedirs(os.path.dirname(DROPIN), exist_ok=True)
+    with open(DROPIN, "w") as f:
+        f.write(f"[Service]\nExecStart=\nExecStart={XRAY} run -confdir {CONF_DIR}\n")
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    if not NO_RESTART:
+        subprocess.run(["systemctl", "restart", "xray"], capture_output=True)
+        time.sleep(1)
+        if run_text("systemctl", "is-active", "xray") != "active":
+            undo("Xray с новым конфигом не запустился.")
+    # Порт 443 — всем: раньше он был открыт только мосту.
+    subprocess.run(["ufw", "allow", f'{ib["port"]}/tcp'], capture_output=True)
+    ensure_cron()
+    with contextlib.suppress(OSError):
+        shutil.copy(os.path.abspath(__file__), INSTALLED_TOOL)
+        os.chmod(INSTALLED_TOOL, 0o755)
+    return {"port": ib["port"], "users": [client_name(c) for c in clients]}
+
+
+def cmd_exit(a):
+    as_json = "--json" in a
+    a = [x for x in a if x != "--json"]
+    if a != ["open"]:
+        die("используйте: exitctl exit open [--json]")
+    with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
+        rep = exit_open()
+    if as_json:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    else:
+        print(f'Выход открыт для клиентов: порт {rep["port"]} доступен всем. Мост — пользователь «{BRIDGE_USER}», '
+              "его ссылка не изменилась. Пользователи: exitctl user add ...")
 
 
 def reach_report(host, port):
@@ -1901,7 +1986,7 @@ def cmd_migrate(a):
 
 
 # Команды, которые меняют конфиг или файл ограничений: выполняются по одной (cron и приложение).
-LOCKED = {"add", "remove", "use", "auto", "direct", "user", "migrate"}
+LOCKED = {"add", "remove", "use", "auto", "direct", "user", "migrate", "exit"}
 
 
 def main(a):
@@ -1939,6 +2024,8 @@ def dispatch(a):
         cmd_user(a[1:])
     elif c == "status":
         cmd_status(a[1:])
+    elif c == "exit":
+        cmd_exit(a[1:])
     elif c == "health":
         cmd_health(a[1:])
     elif c == "reach":

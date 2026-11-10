@@ -2,7 +2,7 @@ import './style.css';
 import {
   AddDirect, AddExit, AddUser, AllowBridgeOnExit, BackupServer, ChooseBackupOpen, ChooseBackupSave, AutoExit, ChangeBuiltin, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Health, Install, ListBuiltin, ListExits,
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
-  InspectBackup, ListDirect, MigrateUsers, RemoveDirect, ResetUserTraffic, RestoreBackup, SetCountry, SetUserEnabled, SetUserLimit,
+  InspectBackup, ListDirect, MigrateUsers, OpenExit, RemoveDirect, ResetUserTraffic, RestoreBackup, SetCountry, SetUserEnabled, SetUserLimit,
   UpdateGeodata, UpdateTool, UpdateXray, UseExit,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
@@ -322,7 +322,7 @@ function statusPanel(st) {
       h('div', { class: 'stat' }, h('small', {}, 'Xray'),
         st.xray.active ? h('b', { class: 'pass' }, 'работает')
           : st.xray.version ? h('b', { class: 'fail' }, 'не работает') : h('b', {}, 'не установлен')),
-      st.installed && stat('Режим', MODE_NAMES[st.mode]),
+      st.installed && stat('Режим', st.bridge_user ? 'выход и для клиентов' : MODE_NAMES[st.mode]),
       !st.installed && stat('Годится как', Object.keys(MODE_NAMES)
         .filter((m) => st.capabilities?.[m]).map((m) => MODE_NAMES[m]).join(', ') || 'ничего из вариантов'),
       st.installed && stat('SNI', st.sni),
@@ -347,9 +347,9 @@ function egressWarning(st) {
 
 function renderServerBody(body, server, st) {
   const panels = !st.installed ? [installPanel(server, st)]
-    : st.mode === 'exit' ? [exitInfoPanel(server)]
+    : st.mode === 'exit' ? [exitInfoPanel(server, st)]
       : st.mode === 'bridge' ? [exitsPanel(server), usersPanel(server, st), directPanel(server), migratePanel(server, st)]
-        : [usersPanel(server, st), migratePanel(server, st)];
+        : [st.bridge_user && exitInfoPanel(server, st), usersPanel(server, st), migratePanel(server, st)].filter(Boolean);
   if (st.installed) panels.push(maintenancePanel(server, st));
   body.replaceChildren(...[healthNotice(server.id), egressWarning(st), statusPanel(st), ...panels].filter(Boolean));
   // Открытый сервер проверяем заново, если результат старше 5 минут.
@@ -643,14 +643,41 @@ function builtinBlock(server) {
     h('div', { class: 'row', style: 'margin-top:8px' }, countryField, countryList, countryBtn));
 }
 
-function exitInfoPanel(server) {
+function exitInfoPanel(server, st) {
   const box = h('div', {}, h('p', { class: 'hint' }, 'Получаю ссылку...'));
   ExitLink(server.id).then((link) => {
     box.replaceChildren(h('p', { class: 'link' }, link), h('div', { class: 'row' },
       h('button', { onclick: (e) => { ClipboardSetText(link); e.target.textContent = 'Скопировано'; } }, 'Копировать')));
   }).catch((e) => box.replaceChildren(h('div', { class: 'error' }, msg(e))));
-  return h('div', { class: 'panel' }, h('h3', {}, 'Выход: ссылка для моста'),
-    h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'Порт 443 этого сервера открыт только для адреса моста, указанного при установке.'), box);
+  if (st.bridge_user) {
+    return h('div', { class: 'panel' }, h('h3', {}, 'Выход: ссылка для моста'),
+      h('p', { class: 'hint', style: 'margin-bottom:8px' },
+        'Этот выход открыт и для клиентов. Мост подключается к нему как пользователь «bridge»: не удаляйте и не отключайте его. Ссылка для моста прежняя.'), box);
+  }
+  const errorBox = h('div');
+  const log = h('div', { class: 'log', hidden: true });
+  const openBtn = h('button', {}, 'Открыть выход и для клиентов…');
+  openBtn.addEventListener('click', async () => {
+    const ok = await confirmDialog('Открыть выход для клиентов?',
+      'Клиенты смогут подключаться к этому серверу напрямую, без моста, а мост продолжит работать через него как раньше: его ссылка не изменится. '
+      + 'Порт 443 откроется для всех, а на сервере появятся пользователи, сроки, лимиты и счётчики трафика, как в простом режиме; мост станет пользователем «bridge». '
+      + 'Учтите: чем больше клиентов знают адрес выхода, тем выше шанс, что его заметят и заблокируют, и тогда мост тоже потеряет этот выход. Xray один раз перезапустится.',
+      'Открыть');
+    if (!ok) return;
+    errorBox.replaceChildren();
+    openBtn.disabled = true;
+    try {
+      await OpenExit(server.id);
+      openServer(server.id);
+    } catch (e) {
+      errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+      openBtn.disabled = false;
+    }
+  });
+  return h('div', { class: 'panel' }, h('h3', {}, 'Выход: ссылка для моста'), errorBox,
+    h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'Порт 443 этого сервера открыт только для адреса моста, указанного при установке.'), box,
+    h('div', { style: 'margin-top:12px' }, openBtn,
+      h('p', { class: 'hint' }, 'Чтобы клиенты подключались и сюда напрямую, без моста. Ссылка моста при этом не меняется.')), log);
 }
 
 function exitsPanel(server) {
@@ -1016,7 +1043,7 @@ function limitsDialog(server, u) {
   });
 }
 
-function usersPanel(server) {
+function usersPanel(server, st = {}) {
   const list = h('div', {}, h('p', { class: 'hint' }, 'Загружаю пользователей...'));
   const errorBox = h('div');
   const nameInput = h('input', { placeholder: 'phone-anna' });
@@ -1037,11 +1064,12 @@ function usersPanel(server) {
             u.expires ? new Date(u.expires * 1000).toLocaleDateString('ru-RU') : '—'),
           h('td', { class: 'actions' },
             h('button', { disabled: !u.link, onclick: () => showLink(u) }, 'Ссылка и QR'),
-            h('button', { onclick: async () => { if (await limitsDialog(server, u)) load(); } }, 'Ограничения'),
-            u.disabled
-              ? h('button', { onclick: () => toggle(u, true) }, 'Включить')
-              : h('button', { onclick: () => toggle(u, false) }, 'Отключить'),
-            h('button', { class: 'danger', disabled: !u.disabled && activeCount === 1, onclick: () => remove(u) }, 'Удалить')))))));
+            ...(u.name === 'bridge' && st.bridge_user ? [h('span', { class: 'hint' }, 'это мост')] : [
+              h('button', { onclick: async () => { if (await limitsDialog(server, u)) load(); } }, 'Ограничения'),
+              u.disabled
+                ? h('button', { onclick: () => toggle(u, true) }, 'Включить')
+                : h('button', { onclick: () => toggle(u, false) }, 'Отключить'),
+              h('button', { class: 'danger', disabled: !u.disabled && activeCount === 1, onclick: () => remove(u) }, 'Удалить')])))))));
     } catch (e) {
       list.replaceChildren();
       showError(e);

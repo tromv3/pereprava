@@ -94,6 +94,10 @@ export function MigrateUsers(arg1, arg2, arg3) {
   return window['go']['main']['App']['MigrateUsers'](arg1, arg2, arg3);
 }
 
+export function OpenExit(arg1) {
+  return window['go']['main']['App']['OpenExit'](arg1);
+}
+
 export function QRCode(arg1) {
   return window['go']['main']['App']['QRCode'](arg1);
 }

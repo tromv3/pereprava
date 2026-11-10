@@ -49,6 +49,8 @@ export function ListUsers(arg1:string):Promise<any>;
 
 export function MigrateUsers(arg1:string,arg2:string,arg3:boolean):Promise<any>;
 
+export function OpenExit(arg1:string):Promise<any>;
+
 export function QRCode(arg1:string):Promise<string>;
 
 export function RemoveDirect(arg1:string,arg2:string):Promise<void>;

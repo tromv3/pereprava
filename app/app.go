@@ -558,6 +558,15 @@ func (a *App) ListDirect(id string) (any, error) {
 	return a.tool(id, false, "direct", "list", "--json")
 }
 
+// OpenExit открывает выход и для клиентов (exitctl exit open): раскладка простого режима с теми же ключами,
+// мост становится пользователем bridge, его ссылка не меняется, порт 443 открывается всем.
+func (a *App) OpenExit(id string) (any, error) {
+	if err := a.ensurePython(id); err != nil {
+		return nil, err
+	}
+	return a.tool(id, true, "exit", "open", "--json")
+}
+
 // ListBuiltin возвращает встроенные списки «напрямую» моста: {domains, ips}.
 func (a *App) ListBuiltin(id string) (any, error) {
 	return a.tool(id, false, "direct", "builtin", "--json")
