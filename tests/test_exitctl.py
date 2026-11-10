@@ -542,6 +542,70 @@ c, o, e = cli("user", "enforce", "--json")
 expect("enforce без API: collected false, без ошибок", c == 0 and json.loads(o)["collected"] is False, (o, e))
 mode["api"] = True
 
+# --- встроенные списки «напрямую» и страна моста
+mode.update(api=True, test_rc=0, live_rc=0)
+b = bridge_base(src_clients, "P", ["aa"], ["domain:gosuslugi.ru"])
+b["api"] = {"tag": "api", "listen": "127.0.0.1:10085", "services": ["HandlerService", "StatsService", "RoutingService"]}
+# Как в установках до тегов: правила без ruleTag между user-direct и to-exits
+b["routing"]["rules"][1:1] = [{"protocol": ["bittorrent"], "outboundTag": "block"},
+                              {"domain": list(ex.RU_DOMAINS), "outboundTag": "direct"},
+                              {"ip": ["geoip:ru", "geoip:private"], "outboundTag": "direct"}]
+put(b, [exit_us])
+def builtin():
+    c, o, e = cli("direct", "builtin", "--json")
+    return json.loads(o) if c == 0 else None
+def tags():
+    return [r.get("ruleTag") for r in read_base()["routing"]["rules"]]
+expect("builtin: старые правила найдены", builtin() == {"domains": list(ex.RU_DOMAINS), "ips": ["geoip:ru", "geoip:private"]}, builtin())
+reset()
+c, o, e = cli("direct", "builtin", "remove", "geosite:VK", "--json")
+expect("builtin remove: на лету, правила получили теги", c == 0 and calls() == ["adrules"] and "geosite:vk" not in json.loads(o)["domains"]
+       and tags() == ["user-direct", None, "builtin-domains", "builtin-ips", "to-exits"], (o, e, tags()))
+c, o, e = cli("direct", "builtin", "add", "10.20.0.0/16")
+expect("builtin add: сеть в адресах", c == 0 and "10.20.0.0/16" in builtin()["ips"], (o, e))
+c, o, e = cli("direct", "builtin", "add", "domain:by")
+expect("builtin add: зона в доменах", c == 0 and builtin()["domains"][-1] == "domain:by", (o, e))
+for bad in ("http://x.ru", "geosite:", "домен", "1.2.3.4/99"):
+    expect(f"builtin add: неверная запись {bad}", cli("direct", "builtin", "add", bad)[0] == 1)
+expect("builtin add: повтор", cli("direct", "builtin", "add", "domain:by")[0] == 1)
+expect("builtin remove: нет такой", cli("direct", "builtin", "remove", "domain:xx")[0] == 1)
+geo = os.path.join(tmp, "geo"); os.makedirs(geo, exist_ok=True)
+def geo_file(name, codes):
+    data = b""
+    for c in codes:
+        entry = b"\x0a" + bytes([len(c)]) + c.encode() + b"\x12\x02\x08\x01"
+        data += b"\x0a" + bytes([len(entry)]) + entry
+    open(os.path.join(geo, name), "wb").write(data)
+geo_file("geosite.dat", ["CATEGORY-KZ", "CN", "CATEGORY-RU"])
+geo_file("geoip.dat", ["RU", "KZ", "BY", "PRIVATE"])
+os.environ["XRAY_LOCATION_ASSET"] = geo
+expect("geo_codes: имена из protobuf", ex.geo_codes("geoip") == {"RU", "KZ", "BY", "PRIVATE"}, ex.geo_codes("geoip"))
+c, o, e = cli("direct", "country", "de")
+expect("country de: нет в geoip — совет обновить списки", c == 1 and "Обновите списки сайтов" in e, (o, e))
+c, o, e = cli("direct", "builtin", "add", "geosite:category-xx")
+expect("builtin add: категории нет в geosite — отказ", c == 1 and "category-xx" in e, (o, e))
+c, o, e = cli("direct", "country", "kz", "--json")
+expect("country kz: категория есть в geosite", c == 0 and json.loads(o) == {"domains": ["geosite:category-kz", "domain:kz"], "ips": ["geoip:kz", "geoip:private"]}, (o, e))
+c, o, e = cli("direct", "country", "by", "--json")
+expect("country by: категории нет — только зона", c == 0 and json.loads(o)["domains"] == ["domain:by"], (o, e))
+c, o, e = cli("direct", "country", "ru", "--json")
+expect("country ru: прежний набор", c == 0 and json.loads(o)["domains"] == list(ex.RU_DOMAINS), o)
+expect("country: неверный код", cli("direct", "country", "rus")[0] == 1)
+for d in list(ex.RU_DOMAINS):
+    cli("direct", "builtin", "remove", d)
+expect("пустой список доменов: правила нет", "builtin-domains" not in tags() and builtin()["domains"] == [], tags())
+cli("direct", "builtin", "add", "domain:ru")
+expect("снова добавлено: правило перед адресами", tags()[-3:] == ["builtin-domains", "builtin-ips", "to-exits"], tags())
+expect("свои домены не тронуты", read_base()["routing"]["rules"][0] == {"ruleTag": "user-direct", "domain": ["domain:gosuslugi.ru"], "outboundTag": "direct"})
+mode["test_rc"] = 1; before = open(os.path.join(tmp, "00_base.json")).read()
+expect("Xray не принял список: откат", cli("direct", "builtin", "add", "10.9.0.0/16")[0] == 1 and open(os.path.join(tmp, "00_base.json")).read() == before)
+mode["test_rc"] = 0
+del os.environ["XRAY_LOCATION_ASSET"]
+c, o, e = cli("direct", "builtin")
+expect("builtin текстом", c == 0 and "Домены:" in o and "domain:ru" in o, o)
+put(json.loads(json.dumps(base)), [])
+expect("builtin на простом сервере — отказ", cli("direct", "builtin")[0] == 1)
+
 shutil.rmtree(tmp, ignore_errors=True)
 print("Всего:", len(res), "ошибок:", res.count(False))
 sys.exit(1 if False in res else 0)

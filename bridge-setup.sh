@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Настройка моста: Xray + VLESS Reality для клиентов, сайты РФ напрямую,
+# Настройка моста: Xray + VLESS Reality для клиентов, сайты своей страны напрямую,
 # остальное через выходы (их добавляет exitctl).
-# Запуск:  bash bridge-setup.sh [SNI]     (exitctl должен лежать рядом)
+# Запуск:  [COUNTRY=ru] bash bridge-setup.sh [SNI]     (exitctl должен лежать рядом)
+# COUNTRY — код страны моста (ru, by, kz...): её сайты и адреса мост открывает сам.
 set -euo pipefail
 
 SNI="${1:-www.samsung.com}"
+COUNTRY="${COUNTRY:-ru}"
 PORT=443
 DIR=/usr/local/etc/xray/conf.d
 INFO=/root/bridge-info.txt
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 [ "$(id -u)" = 0 ] || { echo "Запустите от root"; exit 1; }
+[[ "$COUNTRY" =~ ^[a-z]{2}$ ]] || { echo "COUNTRY — две латинские буквы, например ru или kz"; exit 1; }
 [ -f "$HERE/exitctl" ] || { echo "Положите exitctl рядом с этим скриптом"; exit 1; }
 if [ -f "$DIR/00_base.json" ]; then
   echo "$DIR/00_base.json уже существует — мост уже настроен. Удалите файл, если хотите начать заново."
@@ -79,9 +82,10 @@ cat > "$DIR/00_base.json" <<EOF
     "balancers": [{ "tag": "exits", "selector": ["exit-"], "strategy": { "type": "leastPing" } }],
     "rules": [
       { "protocol": ["bittorrent"], "outboundTag": "block" },
-      { "domain": ["geosite:category-ru", "geosite:yandex", "geosite:vk", "geosite:mailru",
-                   "domain:ru", "domain:su", "domain:xn--p1ai"], "outboundTag": "direct" },
-      { "ip": ["geoip:ru", "geoip:private"], "outboundTag": "direct" },
+      { "ruleTag": "builtin-domains", "outboundTag": "direct",
+        "domain": ["geosite:category-ru", "geosite:yandex", "geosite:vk", "geosite:mailru",
+                   "domain:ru", "domain:su", "domain:xn--p1ai"] },
+      { "ruleTag": "builtin-ips", "ip": ["geoip:ru", "geoip:private"], "outboundTag": "direct" },
       { "ruleTag": "to-exits", "inboundTag": ["in"], "balancerTag": "exits" }
     ]
   }
@@ -92,6 +96,11 @@ EOF
 xray run -test -confdir "$DIR" >/dev/null
 systemctl enable xray >/dev/null 2>&1
 systemctl restart xray
+
+# Страна моста: какие сайты он открывает сам. По умолчанию ru, другие списки ставит exitctl.
+if [ "$COUNTRY" != ru ]; then
+  exitctl direct country "$COUNTRY"
+fi
 
 # Учёт трафика, сроки и лимиты пользователей: каждые 5 минут (exitctl user enforce)
 cat > /etc/cron.d/exitctl-users <<'EOF'

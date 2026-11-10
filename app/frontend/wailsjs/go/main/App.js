@@ -26,6 +26,10 @@ export function BackupServer(arg1, arg2, arg3) {
   return window['go']['main']['App']['BackupServer'](arg1, arg2, arg3);
 }
 
+export function ChangeBuiltin(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ChangeBuiltin'](arg1, arg2, arg3);
+}
+
 export function CheckExits(arg1) {
   return window['go']['main']['App']['CheckExits'](arg1);
 }
@@ -62,8 +66,12 @@ export function InspectBackup(arg1) {
   return window['go']['main']['App']['InspectBackup'](arg1);
 }
 
-export function Install(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['Install'](arg1, arg2, arg3, arg4);
+export function Install(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['Install'](arg1, arg2, arg3, arg4, arg5);
+}
+
+export function ListBuiltin(arg1) {
+  return window['go']['main']['App']['ListBuiltin'](arg1);
 }
 
 export function ListDirect(arg1) {
@@ -116,6 +124,10 @@ export function SaveServer(arg1) {
 
 export function ScanSNI(arg1, arg2) {
   return window['go']['main']['App']['ScanSNI'](arg1, arg2);
+}
+
+export function SetCountry(arg1, arg2) {
+  return window['go']['main']['App']['SetCountry'](arg1, arg2);
 }
 
 export function SetUserEnabled(arg1, arg2, arg3) {

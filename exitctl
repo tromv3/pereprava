@@ -10,6 +10,9 @@
   exitctl direct add <домен>       пускать домен напрямую с моста
   exitctl direct remove <домен>    убрать домен из списка «напрямую»
   exitctl direct list [--json]     список своих доменов «напрямую»
+  exitctl direct builtin [add|remove <запись>] [--json]
+                                   встроенные списки «напрямую»: geosite:, domain:, geoip:, IP/сеть
+  exitctl direct country <код>     встроенные списки для страны моста (ru, by, kz...)
   exitctl sni check <домен> [--ip IP] [--tries N] [--json]
                                    проверить домен для SNI (код выхода 1 — не подходит)
   exitctl sni scan [--ip IP] [--role bridge|exit] [--top N] [--workers N] [--max-checks N] [--json]
@@ -43,6 +46,11 @@ NO_RESTART = os.environ.get("XRAY_NO_RESTART") == "1"
 PREFIX = "exit-"
 RULE_EXITS = "to-exits"
 RULE_DIRECT = "user-direct"
+RULE_BUILTIN_DOMAINS = "builtin-domains"  # встроенные списки «напрямую» на мосту
+RULE_BUILTIN_IPS = "builtin-ips"
+RU_DOMAINS = ("geosite:category-ru", "geosite:yandex", "geosite:vk", "geosite:mailru",
+              "domain:ru", "domain:su", "domain:xn--p1ai")
+GEO_DIR = "/usr/local/share/xray"
 API_SERVER = "127.0.0.1:10085"
 LIVE_SERVICES = ("HandlerService", "RoutingService")  # пользователи, выходы и правила без перезапуска
 # Сроки, лимиты, накопленный трафик и отключённые пользователи. Лежит вне conf.d: Xray читает оттуда все *.json.
@@ -493,6 +501,163 @@ def cmd_direct(action, domain=None, as_json=False):
         rules.insert(0, {"ruleTag": RULE_DIRECT, "domain": doms, "outboundTag": "direct"})
     apply_routing_change(base, ex, ex)
     print(("Добавлен" if action == "add" else "Удалён") + f" {d[7:]}")
+
+
+def geo_codes(kind):
+    """Имена списков в geoip.dat или geosite.dat (заглавными) или None, если файла нет.
+
+    Файл — protobuf: повторяющееся поле 1 (запись), у записи поле 1 — имя. Читаются только имена.
+    Установщик Xray ставит урезанный geoip (из стран — RU, CN, IR), полный даёт v2fly.
+    """
+    def varint(b, i):
+        r = sh = 0
+        while True:
+            x = b[i]
+            i += 1
+            r |= (x & 0x7f) << sh
+            sh += 7
+            if x < 0x80:
+                return r, i
+    for d in (os.environ.get("XRAY_LOCATION_ASSET"), os.path.dirname(XRAY), GEO_DIR):
+        path = os.path.join(d, f"{kind}.dat") if d else None
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, "rb") as f:
+            b = f.read()
+        names, i = set(), 0
+        try:
+            while i < len(b):
+                _, i = varint(b, i)
+                ln, i = varint(b, i)
+                entry, i = b[i:i + ln], i + ln
+                _, j = varint(entry, 0)
+                nl, j = varint(entry, j)
+                names.add(entry[j:j + nl].decode("ascii", "replace").upper())
+        except IndexError:
+            return None
+        return names
+    return None
+
+
+def geo_missing(entry):
+    """Сообщение, если записи geoip:/geosite: нет в списках на сервере; None, если есть или файла нет."""
+    kind, _, name = entry.partition(":")
+    if kind not in ("geoip", "geosite"):
+        return None
+    name = name.lstrip("!").split("@")[0]
+    codes = geo_codes(kind)
+    if codes is None or name.upper() in codes:
+        return None
+    return (f"в списках {kind}.dat на сервере нет «{name}». Обновите списки сайтов в «Обслуживании» приложения: "
+            "оно ставит полные списки v2fly, а установщик Xray — урезанные, где из стран есть только ru, cn и ir")
+
+
+def country_preset(cc):
+    """Встроенные списки «напрямую» для страны моста: (домены, адреса)."""
+    if cc == "ru":
+        return list(RU_DOMAINS), ["geoip:ru", "geoip:private"]
+    missing = geo_missing(f"geoip:{cc}")
+    if missing:
+        die(missing)
+    domains = [f"domain:{cc}"]
+    if not geo_missing(f"geosite:category-{cc}") and geo_codes("geosite") is not None:
+        domains.insert(0, f"geosite:category-{cc}")
+    return domains, [f"geoip:{cc}", "geoip:private"]
+
+
+def builtin_rules(base):
+    """Правила встроенных списков: (домены, адреса), каждое — правило или None.
+
+    В установках до появления тегов правила ищутся по виду (direct, домены или адреса,
+    не user-direct) и получают теги, чтобы дальше их находить по имени.
+    """
+    rules = base["routing"]["rules"]
+    found = {}
+    for tag, key in ((RULE_BUILTIN_DOMAINS, "domain"), (RULE_BUILTIN_IPS, "ip")):
+        r = find_rule(base, tag)
+        if not r:
+            r = next((x for x in rules if x.get("outboundTag") == "direct" and key in x
+                      and not x.get("ruleTag") and len(x) == 2), None)
+            if r:
+                r["ruleTag"] = tag
+        found[key] = r
+    return found["domain"], found["ip"]
+
+
+def set_builtin(base, domains, ips):
+    """Заменить встроенные списки. Пустой список — правила нет: Xray не принимает правило без условий."""
+    rules = base["routing"]["rules"]
+    for tag, key, values in ((RULE_BUILTIN_DOMAINS, "domain", domains), (RULE_BUILTIN_IPS, "ip", ips)):
+        r = builtin_rules(base)[0 if key == "domain" else 1]
+        if r and not values:
+            rules.remove(r)
+        elif r:
+            r[key] = list(values)
+        elif values:
+            # Новое правило — перед to-exits, после остальных, а домены — перед адресами.
+            pos = next((i for i, x in enumerate(rules) if x.get("ruleTag") in (RULE_EXITS, RULE_BUILTIN_IPS)), len(rules))
+            rules.insert(pos, {"ruleTag": tag, key: list(values), "outboundTag": "direct"})
+
+
+def builtin_entry(raw):
+    """Запись встроенного списка: ("domain"|"ip", значение) или die."""
+    v = raw.strip().lower()
+    if re.fullmatch(r"geosite:[a-z0-9!@._-]+", v) or re.fullmatch(r"(domain|full|keyword):[a-z0-9._-]+", v):
+        return "domain", v
+    if re.fullmatch(r"geoip:!?[a-z0-9_-]+", v):
+        return "ip", v
+    with contextlib.suppress(ValueError):
+        return "ip", str(ipaddress.ip_network(v, strict=False))
+    die(f"«{raw}» не похоже на запись списка: geosite:категория, domain:зона, full:домен, keyword:слово, "
+        "geoip:страна или IP/сеть")
+
+
+def cmd_builtin(a):
+    """exitctl direct builtin [--json] | add <запись> | remove <запись>; exitctl direct country <код>."""
+    as_json = "--json" in a
+    a = [x for x in a if x != "--json"]
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    if not base.get("routing", {}).get("balancers"):
+        die("встроенные списки есть только на мосту: простой сервер и так всё открывает напрямую")
+    rd, ri = builtin_rules(base)
+    domains, ips = list(rd["domain"]) if rd else [], list(ri["ip"]) if ri else []
+    if not a:
+        if as_json:
+            print(json.dumps({"domains": domains, "ips": ips}, ensure_ascii=False, indent=2))
+        else:
+            print("Домены:", ", ".join(domains) or "—")
+            print("Адреса:", ", ".join(ips) or "—")
+        return
+    if a[0] == "country" and len(a) == 2:
+        cc = a[1].strip().lower()
+        if not re.fullmatch(r"[a-z]{2}", cc):
+            die("код страны — две латинские буквы, например ru, by, kz")
+        domains, ips = country_preset(cc)
+        what = f"списки для страны {cc}"
+    elif a[0] in ("add", "remove") and len(a) == 2:
+        kind, v = builtin_entry(a[1])
+        lst = domains if kind == "domain" else ips
+        if a[0] == "add":
+            if v in lst:
+                die(f"{v} уже в списке")
+            missing = geo_missing(v)
+            if missing:
+                die(missing)
+            lst.append(v)
+        else:
+            if v not in lst:
+                die(f"{v} нет в списке")
+            lst.remove(v)
+        what = ("добавлено " if a[0] == "add" else "убрано ") + v
+    else:
+        die("используйте: exitctl direct builtin [add|remove <запись>] [--json] или exitctl direct country <код>")
+    set_builtin(base, domains, ips)
+    with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
+        apply_routing_change(base, ex, ex)
+    if as_json:
+        print(json.dumps({"domains": domains, "ips": ips}, ensure_ascii=False, indent=2))
+    else:
+        print(f"Встроенные списки: {what}.")
 
 
 def normalize_domain(s):
@@ -1763,6 +1928,8 @@ def dispatch(a):
         cmd_auto()
     elif c == "check":
         cmd_check("--json" in a[1:])
+    elif c == "direct" and len(a) >= 2 and a[1] in ("builtin", "country"):
+        cmd_builtin(a[2:] if a[1] == "builtin" else a[1:])
     elif c == "direct" and len(a) >= 2:
         rest = [x for x in a[2:] if x != "--json"]
         cmd_direct(a[1], rest[0] if rest else None, "--json" in a[2:])

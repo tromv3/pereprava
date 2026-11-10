@@ -201,3 +201,9 @@ td.actions button { margin-left: 6px; }
 tr.off td { color: var(--muted); }
 tr.off td small.fail { color: var(--bad); }
 th { white-space: nowrap; }
+.builtin { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
+.builtin h4 { margin: 0 0 4px; font-size: 14px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 12px; padding: 2px 4px 2px 10px; font: 12.5px Consolas, monospace; }
+.chip-x { border: 0; background: transparent; color: var(--muted); padding: 0 6px; line-height: 1.4; }
+.chip-x:hover { color: var(--bad); }

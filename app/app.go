@@ -28,8 +28,9 @@ import (
 )
 
 var (
-	reDomain = regexp.MustCompile(`^[A-Za-z0-9а-яА-ЯёЁ.:/-]+$`)
-	reUser   = regexp.MustCompile(`^[A-Za-z0-9 _-]+$`)
+	reDomain  = regexp.MustCompile(`^[A-Za-z0-9а-яА-ЯёЁ.:/-]+$`)
+	reUser    = regexp.MustCompile(`^[A-Za-z0-9 _-]+$`)
+	reCountry = regexp.MustCompile(`^[a-z]{2}$`)
 )
 
 // ServerView — сервер без секретов, для интерфейса.
@@ -553,9 +554,33 @@ func (a *App) AllowBridgeOnExit(exitID, bridgeID string) error {
 }
 
 // ListDirect возвращает свои домены, которые мост открывает напрямую.
-func (a *App) ListDirect(id string) (any, error) { return a.tool(id, false, "direct", "list", "--json") }
+func (a *App) ListDirect(id string) (any, error) {
+	return a.tool(id, false, "direct", "list", "--json")
+}
 
-// AddDirect добавляет домен в список «напрямую». Xray при этом перезапускается.
+// ListBuiltin возвращает встроенные списки «напрямую» моста: {domains, ips}.
+func (a *App) ListBuiltin(id string) (any, error) {
+	return a.tool(id, false, "direct", "builtin", "--json")
+}
+
+// ChangeBuiltin добавляет (add) или убирает (remove) запись встроенного списка: geosite:, domain:, geoip:, IP/сеть.
+func (a *App) ChangeBuiltin(id, action, entry string) (any, error) {
+	if action != "add" && action != "remove" {
+		return nil, errors.New("неизвестное действие")
+	}
+	return a.tool(id, false, "direct", "builtin", action, strings.TrimSpace(entry), "--json")
+}
+
+// SetCountry заменяет встроенные списки наборами для страны моста.
+func (a *App) SetCountry(id, country string) (any, error) {
+	country = strings.ToLower(strings.TrimSpace(country))
+	if !reCountry.MatchString(country) {
+		return nil, errors.New("код страны — две латинские буквы, например ru или kz")
+	}
+	return a.tool(id, false, "direct", "country", country, "--json")
+}
+
+// AddDirect добавляет домен в список «напрямую».
 func (a *App) AddDirect(id, domain string) error {
 	domain = strings.TrimSpace(domain)
 	if !reDomain.MatchString(domain) {
@@ -564,7 +589,7 @@ func (a *App) AddDirect(id, domain string) error {
 	return a.plainTool(id, "direct", "add", domain)
 }
 
-// RemoveDirect убирает домен из списка «напрямую». Xray при этом перезапускается.
+// RemoveDirect убирает домен из списка «напрямую».
 func (a *App) RemoveDirect(id, domain string) error {
 	return a.plainTool(id, "direct", "remove", domain)
 }
@@ -594,13 +619,19 @@ func (a *App) CheckSNI(id, domain string) (any, error) {
 }
 
 // setupCommand собирает команду установки для роли.
-func setupCommand(dir, mode, sni, bridgeIP string, sshPort int) (string, error) {
+func setupCommand(dir, mode, sni, bridgeIP, country string, sshPort int) (string, error) {
 	env := "DEBIAN_FRONTEND=noninteractive SSH_PORT=" + strconv.Itoa(sshPort) + " bash "
 	switch mode {
 	case "simple":
 		return env + remote.Quote(dir+"/simple-setup.sh") + " " + remote.Quote(sni), nil
 	case "bridge":
-		return env + remote.Quote(dir+"/bridge-setup.sh") + " " + remote.Quote(sni), nil
+		if country = strings.ToLower(strings.TrimSpace(country)); country == "" {
+			country = "ru"
+		}
+		if !reCountry.MatchString(country) {
+			return "", errors.New("код страны — две латинские буквы, например ru или kz")
+		}
+		return "COUNTRY=" + country + " " + env + remote.Quote(dir+"/bridge-setup.sh") + " " + remote.Quote(sni), nil
 	case "exit":
 		ip := net.ParseIP(strings.TrimSpace(bridgeIP))
 		if ip == nil || ip.To4() == nil {
@@ -659,7 +690,8 @@ func (a *App) prepareRestricted(c *conn) error {
 }
 
 // Install настраивает сервер в выбранной роли, вывод идёт событиями log.
-func (a *App) Install(id, mode, sni, bridgeIP string) error {
+// country — код страны моста (ru, kz...): её сайты мост открывает сам; для других ролей не нужен.
+func (a *App) Install(id, mode, sni, bridgeIP, country string) error {
 	sni = strings.TrimSpace(sni)
 	if !reDomain.MatchString(sni) || strings.ContainsAny(sni, ":/") {
 		return errors.New("это не похоже на домен")
@@ -672,7 +704,7 @@ func (a *App) Install(id, mode, sni, bridgeIP string) error {
 	if err != nil {
 		return err
 	}
-	cmd, err := setupCommand(c.dir, mode, sni, bridgeIP, srv.Port)
+	cmd, err := setupCommand(c.dir, mode, sni, bridgeIP, country, srv.Port)
 	if err != nil {
 		return err
 	}

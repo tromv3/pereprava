@@ -1,8 +1,8 @@
 import './style.css';
 import {
-  AddDirect, AddExit, AddUser, AllowBridgeOnExit, BackupServer, ChooseBackupOpen, ChooseBackupSave, AutoExit, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Health, Install, ListExits,
+  AddDirect, AddExit, AddUser, AllowBridgeOnExit, BackupServer, ChooseBackupOpen, ChooseBackupSave, AutoExit, ChangeBuiltin, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Health, Install, ListBuiltin, ListExits,
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
-  InspectBackup, ListDirect, MigrateUsers, RemoveDirect, ResetUserTraffic, RestoreBackup, SetUserEnabled, SetUserLimit,
+  InspectBackup, ListDirect, MigrateUsers, RemoveDirect, ResetUserTraffic, RestoreBackup, SetCountry, SetUserEnabled, SetUserLimit,
   UpdateGeodata, UpdateTool, UpdateXray, UseExit,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
@@ -454,7 +454,7 @@ function maintenancePanel(server, st) {
 
   return h('div', { class: 'panel' }, h('h3', {}, 'Обслуживание'), errorBox,
     st.mode !== 'exit' && h('p', { class: 'hint', style: 'margin-bottom:8px' },
-      'Списки российских сайтов и адресов обычно обновляются на сервере раз в неделю. Если серверу недоступен GitHub, обновляйте их отсюда.'),
+      'Списки сайтов и адресов (geosite, geoip) обычно обновляются на сервере раз в неделю. Если серверу недоступен GitHub, обновляйте их отсюда.'),
     toolOutdated && h('p', { class: 'hint', style: 'margin-bottom:8px' },
       'На сервере старая версия exitctl. Приложению она не мешает, но в консоли сервера будут старые команды.'),
     h('div', { class: 'row' }, buttons), updateHelp(st), log);
@@ -555,7 +555,7 @@ function directPanel(server) {
     list.replaceChildren(domains.length
       ? h('table', {}, h('tbody', {}, domains.map((d) => h('tr', {}, h('td', {}, d),
         h('td', { class: 'actions' }, h('button', { class: 'danger', onclick: () => remove(d) }, 'Убрать'))))))
-      : h('p', { class: 'hint' }, 'Своих доменов нет: напрямую идут только сайты из встроенных списков российских сайтов.'));
+      : h('p', { class: 'hint' }, 'Своих доменов нет: напрямую идут только сайты из встроенных списков ниже.'));
   }
 
   async function act(fn) {
@@ -583,8 +583,64 @@ function directPanel(server) {
   load().catch((e) => { list.replaceChildren(); showError(e); });
   return h('div', { class: 'panel' }, h('h3', {}, 'Сайты напрямую'), errorBox,
     h('p', { class: 'hint', style: 'margin-bottom:8px' },
-      'Эти домены мост открывает сам, не через выход: например, российский сайт, которого нет во встроенных списках, или сайт, который не пускает зарубежные адреса. Поддомены входят автоматически. Список меняется без перезапуска Xray.'),
-    h('div', { class: 'row', style: 'margin-bottom:10px' }, input, addBtn), list);
+      'Эти домены мост открывает сам, не через выход: например, местный сайт, которого нет во встроенных списках, или сайт, который не пускает зарубежные адреса. Поддомены входят автоматически. Списки меняются без перезапуска Xray.'),
+    h('div', { class: 'row', style: 'margin-bottom:10px' }, input, addBtn), list,
+    builtinBlock(server));
+}
+
+// Встроенные списки моста: категории geosite, доменные зоны, geoip и сети.
+function builtinBlock(server) {
+  const box = h('div', {}, h('p', { class: 'hint' }, 'Загружаю встроенные списки...'));
+  const errorBox = h('div');
+  const entry = h('input', { placeholder: 'geosite:категория, domain:зона, geoip:страна или IP/сеть' });
+  const addBtn = h('button', {}, 'Добавить в список');
+  const [countryField, countryList] = countryInput('');
+  const countryBtn = h('button', {}, 'Поставить списки страны');
+  const buttons = [addBtn, countryBtn];
+
+  const chip = (v) => h('span', { class: 'chip' }, v,
+    h('button', { class: 'chip-x', title: 'Убрать', onclick: () => act(() => ChangeBuiltin(server.id, 'remove', v)) }, '×'));
+  function show(data) {
+    box.replaceChildren(
+      h('p', { class: 'hint', style: 'margin:0 0 4px' }, 'Домены (geosite — готовые списки сайтов, domain — вся зона или домен с поддоменами):'),
+      h('div', { class: 'chips' }, data.domains.length ? data.domains.map(chip) : h('span', { class: 'hint' }, 'пусто')),
+      h('p', { class: 'hint', style: 'margin:8px 0 4px' }, 'Адреса (geoip — все адреса страны, private — локальные сети):'),
+      h('div', { class: 'chips' }, data.ips.length ? data.ips.map(chip) : h('span', { class: 'hint' }, 'пусто')));
+  }
+  async function act(fn) {
+    errorBox.replaceChildren();
+    buttons.forEach((b) => { b.disabled = true; });
+    try {
+      show(await fn());
+      return true;
+    } catch (e) {
+      errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+      return false;
+    } finally {
+      buttons.forEach((b) => { b.disabled = false; });
+    }
+  }
+  addBtn.addEventListener('click', async () => {
+    if (await act(() => ChangeBuiltin(server.id, 'add', entry.value))) entry.value = '';
+  });
+  countryBtn.addEventListener('click', async () => {
+    const cc = countryField.value.trim().toLowerCase();
+    if (!/^[a-z]{2}$/.test(cc)) {
+      errorBox.replaceChildren(h('div', { class: 'error' }, 'Код страны — две латинские буквы, например ru или kz.'));
+      return;
+    }
+    const ok = await confirmDialog('Заменить встроенные списки?',
+      `Встроенные списки заменятся набором для страны ${COUNTRIES[cc] || cc.toUpperCase()}: её доменная зона, её адреса (geoip) и, если есть, готовый список её сайтов. Ваши правки встроенных списков пропадут, свои домены выше останутся.`, 'Заменить');
+    if (ok) act(() => SetCountry(server.id, cc));
+  });
+  act(() => ListBuiltin(server.id));
+  return h('div', { class: 'builtin' },
+    h('h4', {}, 'Встроенные списки'),
+    h('p', { class: 'hint', style: 'margin-bottom:8px' },
+      'Всё, что под них попадает, мост тоже открывает сам. Отсюда их можно посмотреть и исправить, а не только дописать свои домены. Записи geosite и geoip берутся из списков сайтов на сервере (их обновляет «Обслуживание»).'),
+    errorBox, box,
+    h('div', { class: 'row', style: 'margin-top:10px' }, entry, addBtn),
+    h('div', { class: 'row', style: 'margin-top:8px' }, countryField, countryList, countryBtn));
 }
 
 function exitInfoPanel(server) {
@@ -622,7 +678,7 @@ function exitsPanel(server) {
     const health = Object.fromEntries((checks || []).map((c) => [c.name, c]));
     const exits = data.exits || [];
     if (!exits.length) {
-      list.replaceChildren(h('p', { class: 'hint' }, 'Выходов нет: сейчас открываются только российские сайты, а остальные работать не будут.'));
+      list.replaceChildren(h('p', { class: 'hint' }, 'Выходов нет: сейчас открываются только сайты, которые мост пускает напрямую, а остальные работать не будут.'));
       return;
     }
     const dead = exits.filter((x) => !health[x.name]?.ok).map((x) => x.name);
@@ -697,9 +753,22 @@ function checksList(checks) {
     h('span', { class: c.status }, `${marks[c.status]}: `), c.message)));
 }
 
+// Страны для моста: код — для geoip и доменной зоны. Любой другой код можно ввести вручную.
+const COUNTRIES = {
+  ru: 'Россия', by: 'Беларусь', kz: 'Казахстан', uz: 'Узбекистан', kg: 'Киргизия', tj: 'Таджикистан',
+  am: 'Армения', az: 'Азербайджан', ge: 'Грузия', md: 'Молдова', ua: 'Украина', tm: 'Туркменистан',
+  tr: 'Турция', ir: 'Иран', cn: 'Китай',
+};
+
+function countryInput(value = 'ru') {
+  const id = `countries-${Math.random().toString(36).slice(2)}`;
+  return [h('input', { list: id, value, maxlength: 2, style: 'width:90px', placeholder: 'ru' }),
+    h('datalist', { id }, Object.entries(COUNTRIES).map(([cc, name]) => h('option', { value: cc }, name)))];
+}
+
 const MODE_HINTS = {
   simple: 'Один сервер: клиенты подключаются к нему напрямую, и он сам выходит в интернет.',
-  bridge: 'Клиенты подключаются сюда. Российские сайты открываются напрямую, остальное идёт через выходы, которые вы добавите после установки.',
+  bridge: 'Клиенты подключаются сюда. Сайты страны моста открываются напрямую, остальное идёт через выходы, которые вы добавите после установки.',
   exit: 'Сервер за рубежом, через который мост выпускает трафик. Порт 443 будет открыт только для адреса моста.',
 };
 
@@ -708,7 +777,7 @@ function installPanel(server, st) {
   const allowed = Object.keys(MODE_NAMES).filter((m) => st.capabilities?.[m]);
   if (!allowed.length) {
     return h('div', { class: 'panel' }, h('h3', {}, 'Настройка'),
-      h('div', { class: 'error' }, 'С этого сервера нет связи ни с зарубежными, ни с российскими адресами, поэтому настроить его нельзя. Проверьте сеть сервера и нажмите «Обновить».'));
+      h('div', { class: 'error' }, 'С этого сервера нет связи ни с зарубежными адресами, ни с ya.ru, поэтому настроить его нельзя. Проверьте сеть сервера и нажмите «Обновить».'));
   }
   let mode = allowed[0];
   const modeHint = h('p', { class: 'hint' }, MODE_HINTS[mode]);
@@ -735,12 +804,19 @@ function installPanel(server, st) {
       h('div', { class: 'row' }, bridgeIp, bridgePick)),
     h('p', { class: 'hint' }, 'Если мост уже есть в списке, выберите его: приложение заранее проверит, достаёт ли он до этого сервера.'),
     reachBox);
+  const [countryField, countryList] = countryInput();
+  const countryBox = h('div', { hidden: mode !== 'bridge', style: 'margin-top:10px' },
+    h('label', { class: 'field', style: 'margin-bottom:4px' },
+      h('span', {}, 'Страна моста: её сайты и адреса мост открывает сам, без выхода'),
+      h('div', { class: 'row' }, countryField, countryList)),
+    h('p', { class: 'hint' }, 'Код из двух букв: ru, by, kz… Списки потом можно поправить в «Сайтах напрямую».'));
   const modeRadios = Object.keys(MODE_NAMES).map((m) => {
     const radio = h('input', { type: 'radio', name: 'mode', checked: m === mode, disabled: !allowed.includes(m), style: 'width:auto;margin-right:6px' });
     radio.addEventListener('change', () => {
       mode = m;
       modeHint.textContent = MODE_HINTS[m];
       bridgeBox.hidden = m !== 'exit';
+      countryBox.hidden = m !== 'bridge';
       results.replaceChildren();
       choose(null);
     });
@@ -844,7 +920,7 @@ function installPanel(server, st) {
     installBtn.disabled = true;
     scanBtn.disabled = true;
     try {
-      await Install(server.id, mode, chosen, bridgeIp.value);
+      await Install(server.id, mode, chosen, bridgeIp.value, countryField.value);
       openServer(server.id);
     } catch (e) {
       showError(e);
@@ -854,7 +930,7 @@ function installPanel(server, st) {
   });
 
   return h('div', { class: 'panel' }, h('h3', {}, 'Настройка'),
-    h('div', { style: 'margin-bottom:6px' }, modeRadios), modeHint, bridgeBox,
+    h('div', { style: 'margin-bottom:6px' }, modeRadios), modeHint, bridgeBox, countryBox,
     h('p', { class: 'hint', style: 'margin-top:10px' }, 'SNI — домен, под который маскируется соединение; лучше брать сайт из той же подсети, что и сервер.'),
     errorBox,
     h('div', { class: 'row', style: 'margin:12px 0' }, scanBtn),

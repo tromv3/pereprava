@@ -15,6 +15,8 @@ export function AutoExit(arg1:string):Promise<void>;
 
 export function BackupServer(arg1:string,arg2:string,arg3:string):Promise<void>;
 
+export function ChangeBuiltin(arg1:string,arg2:string,arg3:string):Promise<any>;
+
 export function CheckExits(arg1:string):Promise<any>;
 
 export function CheckReach(arg1:string,arg2:string):Promise<any>;
@@ -33,7 +35,9 @@ export function Health(arg1:string):Promise<any>;
 
 export function InspectBackup(arg1:string):Promise<backup.Header>;
 
-export function Install(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+export function Install(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<void>;
+
+export function ListBuiltin(arg1:string):Promise<any>;
 
 export function ListDirect(arg1:string):Promise<any>;
 
@@ -60,6 +64,8 @@ export function RestoreBackup(arg1:string,arg2:string,arg3:string,arg4:boolean):
 export function SaveServer(arg1:main.ServerInput):Promise<main.ServerView>;
 
 export function ScanSNI(arg1:string,arg2:string):Promise<any>;
+
+export function SetCountry(arg1:string,arg2:string):Promise<any>;
 
 export function SetUserEnabled(arg1:string,arg2:string,arg3:boolean):Promise<any>;
 
