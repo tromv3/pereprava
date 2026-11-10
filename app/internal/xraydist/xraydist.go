@@ -165,3 +165,29 @@ func Download(ctx context.Context, machine string) (map[string][]byte, error) {
 	}
 	return Extract(archive)
 }
+
+var reTag = regexp.MustCompile(`/tag/v?([0-9][0-9A-Za-z.\-]*)$`)
+
+// LatestVersion узнаёт номер последнего релиза Xray по переадресации страницы latest на страницу тега:
+// так не тратится лимит API GitHub.
+func LatestVersion(ctx context.Context) (string, error) {
+	url := strings.TrimSuffix(BaseURL, "/download")
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{
+		Timeout:       20 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("не удалось узнать последнюю версию Xray: %w", err)
+	}
+	resp.Body.Close()
+	m := reTag.FindStringSubmatch(resp.Header.Get("Location"))
+	if m == nil {
+		return "", fmt.Errorf("не удалось узнать последнюю версию Xray: ответ %d без ссылки на релиз", resp.StatusCode)
+	}
+	return m[1], nil
+}

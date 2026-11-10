@@ -3,7 +3,7 @@ import {
   AddDirect, AddExit, AddUser, AllowBridgeOnExit, BackupServer, ChooseBackupOpen, ChooseBackupSave, AutoExit, ChangeBuiltin, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Health, Install, ListBuiltin, ListExits,
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
   InspectBackup, ListDirect, MigrateUsers, OpenExit, RemoveDirect, ResetUserTraffic, RestoreBackup, SetCountry, SetUserEnabled, SetUserLimit,
-  UpdateGeodata, UpdateTool, UpdateXray, UseExit,
+  LatestXray, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
 
@@ -361,19 +361,24 @@ function maintenancePanel(server, st) {
   const log = h('div', { class: 'log', hidden: true });
   const errorBox = h('div');
   const buttons = [];
+  // Кнопки, которые остаются неактивными и после операций: «Обновить Xray», когда версия последняя.
+  const locked = new Set();
+  let busy = false;
   const run = async (btn, fn, after) => {
     errorBox.replaceChildren();
     log.hidden = false;
     log.textContent = '';
     logTarget = log;
+    busy = true;
     buttons.forEach((b) => { b.disabled = true; });
     try {
       await fn();
-      after();
+      await after();
     } catch (e) {
       errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
     } finally {
-      buttons.forEach((b) => { b.disabled = false; });
+      busy = false;
+      buttons.forEach((b) => { b.disabled = locked.has(b); });
     }
   };
 
@@ -392,12 +397,32 @@ function maintenancePanel(server, st) {
     run(uninstallBtn, () => Uninstall(server.id), () => openServer(server.id));
   });
   const xrayBtn = h('button', {}, 'Обновить Xray');
+  const xrayInfo = h('p', { class: 'hint', style: 'margin-bottom:8px' });
+  let installed = xrayVersion(st.xray.version);
+  let latest = null; // null — ещё узнаём, '' — узнать не удалось
+  const showXray = () => {
+    const upToDate = Boolean(installed && latest && compareVersions(installed, latest) >= 0);
+    if (upToDate) locked.add(xrayBtn); else locked.delete(xrayBtn);
+    if (!busy) xrayBtn.disabled = upToDate;
+    xrayBtn.title = upToDate ? 'На сервере уже последняя версия Xray' : '';
+    xrayInfo.textContent = `Xray на сервере: ${installed || 'версия неизвестна'}. `
+      + (latest === null ? 'Узнаю последнюю версию...'
+        : latest === '' ? 'Последнюю версию узнать не удалось, обновить всё равно можно.'
+          : upToDate ? 'Это последняя версия, обновлять не нужно.' : `Можно обновить до ${latest}.`);
+  };
+  showXray();
+  LatestXray().then((v) => { latest = v; }, () => { latest = ''; }).then(showXray);
   xrayBtn.addEventListener('click', async () => {
     const ok = await confirmDialog('Обновить Xray?',
-      `Последняя версия Xray скачается на этом компьютере и заменит ${(st.xray.version || '').split(' ').slice(0, 2).join(' ') || 'текущую версию'}. Xray перезапустится, у подключённых будет короткий обрыв. Если новая версия не примет настройки или не запустится, вернётся старая.`,
+      `Xray ${latest || 'последней версии'} скачается на этом компьютере и заменит ${installed || 'текущую версию'}. Xray перезапустится, у подключённых будет короткий обрыв. Если новая версия не примет настройки или не запустится, вернётся старая.`,
       'Обновить');
     // Журнал не стираем: в нём итог — обновился Xray или уже был последней версии.
-    if (ok) run(xrayBtn, () => UpdateXray(server.id), () => { log.textContent += 'Готово. Новую версию покажет кнопка «Обновить» вверху.\n'; });
+    if (!ok) return;
+    run(xrayBtn, () => UpdateXray(server.id), async () => {
+      log.textContent += 'Готово.\n';
+      try { installed = xrayVersion((await Status(server.id)).xray.version); } catch { /* останется прежняя */ }
+      showXray();
+    });
   });
   // exitctl ставится на мост и простой сервер; приложение пользуется своей копией,
   // а установленная нужна тем, кто работает в консоли сервера.
@@ -452,12 +477,29 @@ function maintenancePanel(server, st) {
   if (st.mode !== 'exit') buttons.push(saveBtn, restoreBtn);
   buttons.push(uninstallBtn);
 
-  return h('div', { class: 'panel' }, h('h3', {}, 'Обслуживание'), errorBox,
+  return h('div', { class: 'panel' }, h('h3', {}, 'Обслуживание'), errorBox, xrayInfo,
     st.mode !== 'exit' && h('p', { class: 'hint', style: 'margin-bottom:8px' },
       'Списки сайтов и адресов (geosite, geoip) обычно обновляются на сервере раз в неделю. Если серверу недоступен GitHub, обновляйте их отсюда.'),
     toolOutdated && h('p', { class: 'hint', style: 'margin-bottom:8px' },
       'На сервере старая версия exitctl. Приложению она не мешает, но в консоли сервера будут старые команды.'),
     h('div', { class: 'row' }, buttons), updateHelp(st), log);
+}
+
+// Номер версии из первой строки `xray version`: «Xray 26.11.9 (Xray, ...) ...» → «26.11.9».
+function xrayVersion(line) {
+  const m = /^Xray\s+v?(\S+)/.exec(line || '');
+  return m ? m[1] : '';
+}
+
+// Сравнивает версии вида 26.11.9 по числам: <0, 0, >0.
+function compareVersions(a, b) {
+  const pa = a.split('.').map((x) => parseInt(x, 10) || 0);
+  const pb = b.split('.').map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
 }
 
 // Свёрнутая справка: заголовок и пункты списка.

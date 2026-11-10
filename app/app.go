@@ -72,6 +72,10 @@ type App struct {
 	store *store.Store
 	mu    sync.Mutex
 	conns map[string]*conn
+
+	latestMu sync.Mutex
+	latest   string
+	latestAt time.Time
 }
 
 // NewApp создаёт приложение.
@@ -391,6 +395,21 @@ func (a *App) UpdateTool(id string) error {
 		return commandError(r)
 	}
 	return nil
+}
+
+// LatestXray возвращает номер последнего релиза Xray (без «v»), запоминая его на час.
+func (a *App) LatestXray() (string, error) {
+	a.latestMu.Lock()
+	defer a.latestMu.Unlock()
+	if a.latest != "" && time.Since(a.latestAt) < time.Hour {
+		return a.latest, nil
+	}
+	v, err := xraydist.LatestVersion(a.ctx)
+	if err != nil {
+		return "", err
+	}
+	a.latest, a.latestAt = v, time.Now()
+	return v, nil
 }
 
 // UpdateXray скачивает последний Xray на этом компьютере и ставит его на сервер.

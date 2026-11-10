@@ -143,3 +143,25 @@ func TestDownload(t *testing.T) {
 		t.Fatal("404 должен дать ошибку")
 	}
 }
+
+func TestLatestVersion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/releases/latest" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "https://github.com/XTLS/Xray-core/releases/tag/v26.11.9", http.StatusFound)
+	}))
+	defer srv.Close()
+	old := BaseURL
+	defer func() { BaseURL = old }()
+	BaseURL = srv.URL + "/releases/latest/download"
+	v, err := LatestVersion(context.Background())
+	if err != nil || v != "26.11.9" {
+		t.Fatalf("%q %v", v, err)
+	}
+	BaseURL = srv.URL + "/nowhere/download"
+	if _, err := LatestVersion(context.Background()); err == nil {
+		t.Fatal("без переадресации нужна ошибка")
+	}
+}

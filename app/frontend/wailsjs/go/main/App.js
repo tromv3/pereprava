@@ -70,6 +70,10 @@ export function Install(arg1, arg2, arg3, arg4, arg5) {
   return window['go']['main']['App']['Install'](arg1, arg2, arg3, arg4, arg5);
 }
 
+export function LatestXray() {
+  return window['go']['main']['App']['LatestXray']();
+}
+
 export function ListBuiltin(arg1) {
   return window['go']['main']['App']['ListBuiltin'](arg1);
 }

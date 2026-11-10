@@ -37,6 +37,8 @@ export function InspectBackup(arg1:string):Promise<backup.Header>;
 
 export function Install(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<void>;
 
+export function LatestXray():Promise<string>;
+
 export function ListBuiltin(arg1:string):Promise<any>;
 
 export function ListDirect(arg1:string):Promise<any>;
