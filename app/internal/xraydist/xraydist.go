@@ -32,6 +32,10 @@ func ArchiveName(machine string) (string, error) {
 		return "Xray-linux-64.zip", nil
 	case "aarch64", "arm64":
 		return "Xray-linux-arm64-v8a.zip", nil
+	case "windows-amd64":
+		return "Xray-windows-64.zip", nil
+	case "windows-arm64":
+		return "Xray-windows-arm64-v8a.zip", nil
 	}
 	return "", fmt.Errorf("архитектура сервера %q не поддерживается", strings.TrimSpace(machine))
 }
@@ -74,14 +78,17 @@ func Verify(archive []byte, dgst string) error {
 }
 
 // Extract достаёт из архива файлы Files.
-func Extract(archive []byte) (map[string][]byte, error) {
+func Extract(archive []byte) (map[string][]byte, error) { return ExtractNames(archive, Files, nil) }
+
+// ExtractNames достаёт из архива файлы names (обязательные) и optional (если есть).
+func ExtractNames(archive []byte, names, optional []string) (map[string][]byte, error) {
 	r, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
 	if err != nil {
 		return nil, fmt.Errorf("архив повреждён: %w", err)
 	}
 	out := map[string][]byte{}
 	for _, f := range r.File {
-		for _, want := range Files {
+		for _, want := range append(append([]string{}, names...), optional...) {
 			if f.Name != want {
 				continue
 			}
@@ -97,7 +104,7 @@ func Extract(archive []byte) (map[string][]byte, error) {
 			out[want] = data
 		}
 	}
-	for _, want := range Files {
+	for _, want := range names {
 		if len(out[want]) == 0 {
 			return nil, fmt.Errorf("в архиве нет файла %s", want)
 		}
@@ -172,10 +179,18 @@ func DownloadArchive(ctx context.Context, name string) ([]byte, error) {
 	if err := Verify(archive, string(dgst)); err != nil {
 		return nil, err
 	}
-	if _, err := Extract(archive); err != nil {
+	if _, err := ExtractNames(archive, FilesFor(name), nil); err != nil {
 		return nil, err
 	}
 	return archive, nil
+}
+
+// FilesFor — обязательные файлы архива name: для Windows программа называется xray.exe.
+func FilesFor(name string) []string {
+	if strings.Contains(name, "windows") {
+		return []string{"xray.exe", "geoip.dat", "geosite.dat"}
+	}
+	return Files
 }
 
 var reTag = regexp.MustCompile(`/tag/v?([0-9][0-9A-Za-z.\-]*)$`)

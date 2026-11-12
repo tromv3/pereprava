@@ -58,6 +58,18 @@ export function ChooseXrayFile() {
   return window['go']['main']['App']['ChooseXrayFile']();
 }
 
+export function ClientConnect(arg1) {
+  return window['go']['main']['App']['ClientConnect'](arg1);
+}
+
+export function ClientDisconnect() {
+  return window['go']['main']['App']['ClientDisconnect']();
+}
+
+export function ClientState() {
+  return window['go']['main']['App']['ClientState']();
+}
+
 export function CloseExit(arg1) {
   return window['go']['main']['App']['CloseExit'](arg1);
 }
@@ -136,6 +148,10 @@ export function RemoveUser(arg1, arg2) {
 
 export function ResetUserTraffic(arg1, arg2) {
   return window['go']['main']['App']['ResetUserTraffic'](arg1, arg2);
+}
+
+export function RestartAsAdmin() {
+  return window['go']['main']['App']['RestartAsAdmin']();
 }
 
 export function RestoreBackup(arg1, arg2, arg3, arg4) {

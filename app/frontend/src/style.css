@@ -207,3 +207,4 @@ th { white-space: nowrap; }
 .chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 12px; padding: 2px 4px 2px 10px; font: 12.5px Consolas, monospace; }
 .chip-x { border: 0; background: transparent; color: var(--muted); padding: 0 6px; line-height: 1.4; }
 .chip-x:hover { color: var(--bad); }
+.client-item { margin-bottom: 10px; }

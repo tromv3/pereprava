@@ -4,12 +4,13 @@ import {
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
   CloseExit, InspectBackup, ListDirect, MigrateUsers, OpenExit, RemoveDirect, ResetUserTraffic, RestoreBackup, SetCountry, SetUserEnabled, SetUserLimit,
   LatestXray, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
+  ClientConnect, ClientDisconnect, ClientState, RestartAsAdmin,
   ChooseGeoFiles, ChooseXrayFile, ImportXray, UpdateGeodataFromFiles, UpdateXrayFromFile,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
 
 const root = document.getElementById('app');
-const state = { servers: [], selected: null, view: 'empty', editing: null, health: {}, healthRunning: false };
+const state = { servers: [], selected: null, view: 'empty', editing: null, health: {}, healthRunning: false, client: null };
 let logTarget = null;
 
 // Весь текст попадает в страницу через textContent: данные с серверов разметкой не становятся.
@@ -182,6 +183,12 @@ function renderSide() {
   checkBtn.addEventListener('click', checkAllHealth);
   return h('aside', { class: 'side' },
     h('h1', {}, 'Переправа'),
+    h('button', {
+      class: `server-item client-item${state.view === 'client' ? ' active' : ''}`,
+      onclick: openClient,
+      title: state.client?.running ? 'Клиент подключён' : 'Клиент выключен',
+    }, h('span', { class: `dot dot-${state.client?.running ? 'ok' : 'unknown'}` }), 'Подключение',
+    h('small', {}, state.client?.running ? `к ${state.client.name || state.client.host}` : 'выключено')),
     state.servers.map((s) => {
       const level = state.health[s.id]?.level || 'unknown';
       return h('button', {
@@ -315,8 +322,9 @@ function reachNotice(rep, fromName, toName) {
 
 const MODE_NAMES = { simple: 'простой режим', bridge: 'мост', exit: 'выход' };
 
+const stat = (label, value) => h('div', { class: 'stat' }, h('small', {}, label), h('b', {}, value));
+
 function statusPanel(st) {
-  const stat = (label, value) => h('div', { class: 'stat' }, h('small', {}, label), h('b', {}, value));
   const mem = st.memory;
   return h('div', { class: 'panel' }, h('h3', {}, 'Сервер'),
     h('div', { class: 'stats' },
@@ -1251,6 +1259,170 @@ function usersPanel(server, st = {}) {
     list);
 }
 
+// --- Встроенный клиент
+const CLIENT_MODES = {
+  proxy: ['Системный прокси', 'Браузеры и большинство программ пойдут через сервер. Включается в настройках Windows и выключается при отключении.'],
+  local: ['Только локальный прокси', 'Системные настройки не меняются: укажите прокси в нужных программах сами.'],
+  tun: ['Весь трафик (TUN)', 'Через сервер идёт всё, включая игры и программы без настроек прокси. Нужны права администратора.'],
+};
+
+async function refreshClient() {
+  try { state.client = await ClientState(); } catch { state.client = null; }
+}
+
+async function openClient() {
+  state.view = 'client';
+  state.selected = null;
+  await refreshClient();
+  renderClient();
+}
+
+function renderClient() {
+  const cs = state.client || {};
+  const saved = cs.saved || {};
+  const errorBox = h('div');
+  const showError = (e) => errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+  const logBox = h('div', { class: 'log', hidden: !(cs.log || []).length }, (cs.log || []).join('\n'));
+
+  if (cs.running) {
+    const offBtn = h('button', { class: 'danger' }, 'Отключиться');
+    offBtn.addEventListener('click', async () => {
+      offBtn.disabled = true;
+      await ClientDisconnect();
+      await openClient();
+    });
+    const mode = cs.tun ? 'tun' : cs.systemProxy ? 'proxy' : 'local';
+    render(h('div', {},
+      h('div', { class: 'panel' }, h('h3', {}, 'Подключено'),
+        h('div', { class: 'stats' },
+          stat('Сервер', `${cs.name || '—'} (${cs.host})`),
+          stat('Режим', CLIENT_MODES[mode][0]),
+          stat('SOCKS5', `127.0.0.1:${cs.socksPort}`),
+          stat('HTTP', `127.0.0.1:${cs.httpPort}`),
+          cs.country && stat('Напрямую', COUNTRIES[cs.country] || cs.country.toUpperCase())),
+        h('p', { class: 'hint', style: 'margin:8px 0' }, CLIENT_MODES[mode][1]),
+        h('div', { class: 'row' }, offBtn)),
+      h('div', { class: 'panel' }, h('h3', {}, 'Журнал Xray'), logBox.hidden ? h('p', { class: 'hint' }, 'Пока пусто: Xray пишет сюда только предупреждения и ошибки.') : logBox)));
+    return;
+  }
+
+  // Откуда ссылка: пользователь сервера из списка или своя ссылка.
+  const srcServer = h('input', { type: 'radio', name: 'csrc', checked: !!saved.serverId || !saved.link });
+  const srcLink = h('input', { type: 'radio', name: 'csrc', checked: !saved.serverId && !!saved.link });
+  const serverSel = h('select', { style: 'width:auto' }, h('option', { value: '' }, 'Сервер...'),
+    state.servers.map((s) => h('option', { value: s.id }, s.name)));
+  const userSel = h('select', { style: 'width:auto', disabled: true }, h('option', { value: '' }, 'Пользователь...'));
+  const linkInput = h('textarea', { rows: 3, placeholder: 'vless://...', style: 'width:100%' });
+  if (!saved.serverId && saved.link) linkInput.value = saved.link;
+  let users = [];
+  const loadUsers = async (preselect) => {
+    userSel.replaceChildren(h('option', { value: '' }, 'Загружаю...'));
+    userSel.disabled = true;
+    users = [];
+    if (!serverSel.value) {
+      userSel.replaceChildren(h('option', { value: '' }, 'Пользователь...'));
+      return;
+    }
+    try {
+      users = ((await ListUsers(serverSel.value)) || []).filter((u) => !u.disabled && u.link);
+      userSel.replaceChildren(h('option', { value: '' }, users.length ? 'Пользователь...' : 'Нет активных пользователей'),
+        ...users.map((u) => h('option', { value: u.name }, u.name)));
+      userSel.disabled = !users.length;
+      if (preselect && users.some((u) => u.name === preselect)) userSel.value = preselect;
+    } catch (e) {
+      userSel.replaceChildren(h('option', { value: '' }, 'Не удалось загрузить'));
+      showError(e);
+    }
+  };
+  serverSel.addEventListener('change', () => { srcServer.checked = true; errorBox.replaceChildren(); loadUsers(); });
+  linkInput.addEventListener('input', () => { srcLink.checked = true; });
+  if (saved.serverId && state.servers.some((s) => s.id === saved.serverId)) {
+    serverSel.value = saved.serverId;
+    loadUsers(saved.user);
+  }
+
+  let mode = saved.tun ? 'tun' : (saved.systemProxy === false && saved.link) ? 'local' : 'proxy';
+  const modeHint = h('p', { class: 'hint' });
+  const adminBox = h('div');
+  const showMode = () => {
+    modeHint.textContent = CLIENT_MODES[mode][1];
+    adminBox.replaceChildren();
+    if (mode === 'tun' && !cs.admin) {
+      const btn = h('button', {}, 'Перезапустить от администратора');
+      btn.addEventListener('click', async () => {
+        try { await RestartAsAdmin(); } catch (e) { showError(e); }
+      });
+      adminBox.replaceChildren(h('div', { class: 'notice' }, 'Приложение запущено без прав администратора. ', btn));
+    }
+  };
+  const modeRadios = Object.entries(CLIENT_MODES).map(([key, [label]]) => {
+    const r = h('input', { type: 'radio', name: 'cmode', checked: key === mode, style: 'width:auto;margin-right:6px' });
+    r.addEventListener('change', () => { mode = key; showMode(); });
+    return h('label', { style: 'margin-right:16px;cursor:pointer' }, r, label);
+  });
+  showMode();
+
+  const countryOn = h('input', { type: 'checkbox', checked: !!saved.country, style: 'width:auto;margin-right:6px' });
+  const [countryField, countryList] = countryInput(saved.country || 'ru');
+
+  const connectBtn = h('button', {}, 'Подключиться');
+  connectBtn.addEventListener('click', async () => {
+    errorBox.replaceChildren();
+    let link = '';
+    let serverId = '';
+    let user = '';
+    if (srcServer.checked) {
+      const u = users.find((x) => x.name === userSel.value);
+      if (!u) { showError('Выберите сервер и пользователя или вставьте ссылку.'); return; }
+      link = u.link; serverId = serverSel.value; user = u.name;
+    } else {
+      link = linkInput.value.trim();
+      if (!link) { showError('Вставьте ссылку vless://'); return; }
+    }
+    connectBtn.disabled = true;
+    connectBtn.textContent = 'Подключаюсь...';
+    logTarget = null;
+    try {
+      await ClientConnect({
+        link, serverId, user, systemProxy: mode === 'proxy', tun: mode === 'tun',
+        country: countryOn.checked ? countryField.value.trim().toLowerCase() : '',
+      });
+      await openClient();
+    } catch (e) {
+      showError(e);
+      connectBtn.disabled = false;
+      connectBtn.textContent = 'Подключиться';
+    }
+  });
+
+  render(h('div', {},
+    h('div', { class: 'panel' }, h('h3', {}, 'Подключение с этого компьютера'),
+      h('p', { class: 'hint', style: 'margin-bottom:10px' },
+        'Встроенный клиент: Xray запускается на этом компьютере и подключается к вашему серверу, отдельная программа вроде v2rayN не нужна. При первом подключении Xray для Windows скачается с GitHub.'),
+      errorBox,
+      h('label', { style: 'display:block;cursor:pointer;margin-bottom:6px' }, srcServer, ' Пользователь сервера из списка'),
+      h('div', { class: 'row', style: 'margin:0 0 12px 22px' }, serverSel, userSel),
+      h('label', { style: 'display:block;cursor:pointer;margin-bottom:6px' }, srcLink, ' Своя ссылка'),
+      h('div', { style: 'margin:0 0 12px 22px' }, linkInput),
+      h('h4', {}, 'Режим'),
+      h('div', { style: 'margin-bottom:6px' }, modeRadios), modeHint, adminBox,
+      h('label', { style: 'display:block;cursor:pointer;margin-top:12px' }, countryOn,
+        'Сайты страны открывать напрямую, мимо сервера: ', countryField, countryList),
+      h('p', { class: 'hint' }, 'Нужно для простого сервера или выхода. Мост и так открывает сайты своей страны сам.'),
+      h('div', { class: 'row', style: 'margin-top:12px' }, connectBtn)),
+    cs.error ? h('div', { class: 'panel' }, h('div', { class: 'error' }, cs.error), logBox) : null));
+}
+
+EventsOn('client', async () => {
+  await refreshClient();
+  if (state.view === 'client') renderClient();
+  else if (state.view === 'server') {
+    // Обновить только значок в боковой панели.
+    const side = document.querySelector('.side');
+    if (side) side.replaceWith(renderSide());
+  }
+});
+
 EventsOn('log', (line) => {
   if (!logTarget) return;
   logTarget.textContent += `${line}\n`;
@@ -1260,6 +1432,7 @@ EventsOn('log', (line) => {
 (async () => {
   try {
     await refreshServers();
+    await refreshClient();
     renderEmpty();
   } catch (e) {
     render(h('div', { class: 'error' }, msg(e)));

@@ -80,6 +80,8 @@ type App struct {
 
 	cache   xraydist.Cache // последние Xray и списки сайтов на этом компьютере
 	logHook func(string)   // для тестов: журнал без окна Wails
+
+	client clientState // встроенный клиент
 }
 
 // NewApp создаёт приложение.
@@ -94,9 +96,12 @@ func (a *App) startup(ctx context.Context) {
 	}
 	a.store = s
 	a.cache = xraydist.Cache{Dir: filepath.Join(s.Dir(), "cache")}
+	a.restoreProxyAfterCrash()
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	a.client.runner.Stop()
+	a.restoreProxyAfterCrash()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for id, c := range a.conns {
@@ -698,11 +703,15 @@ func (a *App) ListDirect(id string) (any, error) {
 // OpenExit открывает выход и для клиентов (exitctl exit open): раскладка простого режима с теми же ключами,
 // мост становится пользователем bridge, его ссылка не меняется, порт 443 открывается всем.
 // Если выход уже открывали и закрывали, возвращаются прежние пользователи.
-func (a *App) OpenExit(id string) error { return a.exitCommand(id, "open", "открыть выход не удалось") }
+func (a *App) OpenExit(id string) error {
+	return a.exitCommand(id, "open", "открыть выход не удалось")
+}
 
 // CloseExit закрывает выход для клиентов (exitctl exit close): снова только мост,
 // пользователи сохраняются на сервере до следующего OpenExit.
-func (a *App) CloseExit(id string) error { return a.exitCommand(id, "close", "закрыть выход не удалось") }
+func (a *App) CloseExit(id string) error {
+	return a.exitCommand(id, "close", "закрыть выход не удалось")
+}
 
 // exitCommand запускает exitctl exit отдельно от SSH: Xray перезапускается, и если компьютер
 // ходит на сервер через этот выход, связь рвётся посреди команды.
