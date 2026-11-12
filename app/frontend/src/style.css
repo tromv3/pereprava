@@ -103,6 +103,7 @@ label.field > span { display: block; margin-bottom: 3px; color: var(--muted); }
 .hint { color: var(--muted); font-size: 12.5px; margin: 3px 0 0; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .row input { flex: 1; min-width: 180px; width: auto; }
+input[type=radio], input[type=checkbox] { width: auto; flex: none; min-width: 0; }
 .form { max-width: 460px; }
 .grid2 { display: grid; grid-template-columns: 1fr 110px; gap: 10px; }
 table { border-collapse: collapse; width: 100%; }

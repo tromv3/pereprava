@@ -1190,14 +1190,15 @@ function usersPanel(server, st = {}) {
       list.replaceChildren(h('table', {},
         h('thead', {}, h('tr', {}, ['Имя', 'Трафик', 'Доступ до', ''].map((t) => h('th', {}, t)))),
         h('tbody', {}, users.map((u) => h('tr', { class: u.disabled ? 'off' : null },
-          h('td', {}, u.name, u.disabled ? h('small', { class: 'fail', style: 'display:block' }, DISABLED_NAMES[u.disabled] || 'отключён') : null),
+          h('td', {}, u.name, u.disabled ? h('small', { class: 'fail', style: 'display:block' }, DISABLED_NAMES[u.disabled] || 'отключён') : null,
+            u.name === 'bridge' && st.bridge_user ? h('small', { class: 'hint', style: 'display:block' }, 'это мост') : null),
           h('td', { class: u.limit && u.total >= u.limit ? 'fail' : null },
             formatBytes(u.total), u.limit ? ` из ${formatBytes(u.limit)}` : ''),
           h('td', { class: u.expires && u.expires * 1000 < Date.now() ? 'fail' : null },
             u.expires ? new Date(u.expires * 1000).toLocaleDateString('ru-RU') : '—'),
           h('td', { class: 'actions' },
             h('button', { disabled: !u.link, onclick: () => showLink(u) }, 'Ссылка и QR'),
-            ...(u.name === 'bridge' && st.bridge_user ? [h('span', { class: 'hint' }, 'это мост')] : [
+            ...(u.name === 'bridge' && st.bridge_user ? [] : [
               h('button', { onclick: async () => { if (await limitsDialog(server, u)) load(); } }, 'Ограничения'),
               u.disabled
                 ? h('button', { onclick: () => toggle(u, true) }, 'Включить')
@@ -1307,8 +1308,8 @@ function renderClient() {
   }
 
   // Откуда ссылка: пользователь сервера из списка или своя ссылка.
-  const srcServer = h('input', { type: 'radio', name: 'csrc', checked: !!saved.serverId || !saved.link });
-  const srcLink = h('input', { type: 'radio', name: 'csrc', checked: !saved.serverId && !!saved.link });
+  const srcServer = h('input', { type: 'radio', name: 'csrc', checked: !!saved.serverId || !saved.link, style: 'width:auto;margin-right:6px' });
+  const srcLink = h('input', { type: 'radio', name: 'csrc', checked: !saved.serverId && !!saved.link, style: 'width:auto;margin-right:6px' });
   const serverSel = h('select', { style: 'width:auto' }, h('option', { value: '' }, 'Сервер...'),
     state.servers.map((s) => h('option', { value: s.id }, s.name)));
   const userSel = h('select', { style: 'width:auto', disabled: true }, h('option', { value: '' }, 'Пользователь...'));
@@ -1408,9 +1409,9 @@ function renderClient() {
       h('p', { class: 'hint', style: 'margin-bottom:10px' },
         'Встроенный клиент: Xray запускается на этом компьютере и подключается к вашему серверу, отдельная программа вроде v2rayN не нужна. При первом подключении Xray скачается с GitHub.'),
       errorBox,
-      h('label', { style: 'display:block;cursor:pointer;margin-bottom:6px' }, srcServer, ' Пользователь сервера из списка'),
+      h('label', { style: 'display:block;cursor:pointer;margin-bottom:6px' }, srcServer, 'Пользователь сервера из списка'),
       h('div', { class: 'row', style: 'margin:0 0 12px 22px' }, serverSel, userSel),
-      h('label', { style: 'display:block;cursor:pointer;margin-bottom:6px' }, srcLink, ' Своя ссылка'),
+      h('label', { style: 'display:block;cursor:pointer;margin-bottom:6px' }, srcLink, 'Своя ссылка'),
       h('div', { style: 'margin:0 0 12px 22px' }, linkInput),
       h('h4', {}, 'Режим'),
       h('div', { style: 'margin-bottom:6px' }, modeRadios), modeHint, adminBox,
