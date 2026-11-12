@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/json"
 	"errors"
+	"runtime"
 )
 
 // Options — как работает клиент.
@@ -50,17 +51,23 @@ func Config(l Link, o Options) ([]byte, error) {
 	}
 	var rules []any
 	if o.TUN {
+		tun := map[string]any{
+			"name": TunName, "mtu": 1500,
+			"gateway": []string{"172.19.0.1/30"},
+			"dns":     []string{"1.1.1.1", "8.8.8.8"},
+			// Весь IPv4 в адаптер; исходящие Xray привязаны к физическому адаптеру, поэтому петли нет.
+			"autoSystemRoutingTable": []string{"0.0.0.0/0"},
+			"autoOutboundsInterface": "auto",
+		}
+		if runtime.GOOS == "windows" {
+			tun["autoSystemWfpBlockLeak"] = []string{"dns", "misconfigtun"}
+		} else {
+			tun["name"] = "pereprava0"
+			tun["autoSystemDnsToGateway"] = true
+		}
 		inbounds = append(inbounds, map[string]any{
 			"tag": "tun", "protocol": "tun",
-			"settings": map[string]any{
-				"name": TunName, "mtu": 1500,
-				"gateway": []string{"172.19.0.1/30"},
-				"dns":     []string{"1.1.1.1", "8.8.8.8"},
-				// Весь IPv4 в адаптер; исходящие Xray привязаны к физическому адаптеру, поэтому петли нет.
-				"autoSystemRoutingTable": []string{"0.0.0.0/0"},
-				"autoOutboundsInterface": "auto",
-				"autoSystemWfpBlockLeak": []string{"dns", "misconfigtun"},
-			},
+			"settings": tun,
 			"sniffing": map[string]any{"enabled": true, "destOverride": []string{"http", "tls", "quic"}, "routeOnly": true},
 		})
 		// DNS из адаптера отвечает Xray: запросы уходят через сервер.

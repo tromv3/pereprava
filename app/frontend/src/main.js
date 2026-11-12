@@ -4,7 +4,7 @@ import {
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
   CloseExit, InspectBackup, ListDirect, MigrateUsers, OpenExit, RemoveDirect, ResetUserTraffic, RestoreBackup, SetCountry, SetUserEnabled, SetUserLimit,
   LatestXray, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
-  ClientConnect, ClientDisconnect, ClientState, RestartAsAdmin,
+  ClientConnect, ClientDisconnect, ClientEnableTUN, ClientState,
   ChooseGeoFiles, ChooseXrayFile, ImportXray, UpdateGeodataFromFiles, UpdateXrayFromFile,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
@@ -1261,7 +1261,7 @@ function usersPanel(server, st = {}) {
 
 // --- Встроенный клиент
 const CLIENT_MODES = {
-  proxy: ['Системный прокси', 'Браузеры и большинство программ пойдут через сервер. Включается в настройках Windows и выключается при отключении.'],
+  proxy: ['Системный прокси', 'Браузеры и большинство программ пойдут через сервер. Включается в настройках системы и выключается при отключении.'],
   local: ['Только локальный прокси', 'Системные настройки не меняются: укажите прокси в нужных программах сами.'],
   tun: ['Весь трафик (TUN)', 'Через сервер идёт всё, включая игры и программы без настроек прокси. Нужны права администратора.'],
 };
@@ -1347,12 +1347,20 @@ function renderClient() {
   const showMode = () => {
     modeHint.textContent = CLIENT_MODES[mode][1];
     adminBox.replaceChildren();
-    if (mode === 'tun' && !cs.admin) {
-      const btn = h('button', {}, 'Перезапустить от администратора');
+    if (mode === 'tun' && !cs.tunReady) {
+      const btn = h('button', {}, cs.os === 'windows' ? 'Перезапустить от администратора' : 'Дать права для TUN');
       btn.addEventListener('click', async () => {
-        try { await RestartAsAdmin(); } catch (e) { showError(e); }
+        btn.disabled = true;
+        try {
+          await ClientEnableTUN();
+          await refreshClient();
+          renderClient();
+        } catch (e) {
+          showError(e);
+          btn.disabled = false;
+        }
       });
-      adminBox.replaceChildren(h('div', { class: 'notice' }, 'Приложение запущено без прав администратора. ', btn));
+      adminBox.replaceChildren(h('div', { class: 'notice' }, `${cs.tunHint} `, btn));
     }
   };
   const modeRadios = Object.entries(CLIENT_MODES).map(([key, [label]]) => {
@@ -1398,7 +1406,7 @@ function renderClient() {
   render(h('div', {},
     h('div', { class: 'panel' }, h('h3', {}, 'Подключение с этого компьютера'),
       h('p', { class: 'hint', style: 'margin-bottom:10px' },
-        'Встроенный клиент: Xray запускается на этом компьютере и подключается к вашему серверу, отдельная программа вроде v2rayN не нужна. При первом подключении Xray для Windows скачается с GitHub.'),
+        'Встроенный клиент: Xray запускается на этом компьютере и подключается к вашему серверу, отдельная программа вроде v2rayN не нужна. При первом подключении Xray скачается с GitHub.'),
       errorBox,
       h('label', { style: 'display:block;cursor:pointer;margin-bottom:6px' }, srcServer, ' Пользователь сервера из списка'),
       h('div', { class: 'row', style: 'margin:0 0 12px 22px' }, serverSel, userSel),

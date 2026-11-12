@@ -35,6 +35,8 @@ export function ClientConnect(arg1:main.ClientRequest):Promise<void>;
 
 export function ClientDisconnect():Promise<void>;
 
+export function ClientEnableTUN():Promise<void>;
+
 export function ClientState():Promise<main.ClientInfo>;
 
 export function CloseExit(arg1:string):Promise<void>;
@@ -76,8 +78,6 @@ export function RemoveExit(arg1:string,arg2:string):Promise<void>;
 export function RemoveUser(arg1:string,arg2:string):Promise<void>;
 
 export function ResetUserTraffic(arg1:string,arg2:string):Promise<any>;
-
-export function RestartAsAdmin():Promise<void>;
 
 export function RestoreBackup(arg1:string,arg2:string,arg3:string,arg4:boolean):Promise<any>;
 

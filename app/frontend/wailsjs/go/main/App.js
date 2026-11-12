@@ -66,6 +66,10 @@ export function ClientDisconnect() {
   return window['go']['main']['App']['ClientDisconnect']();
 }
 
+export function ClientEnableTUN() {
+  return window['go']['main']['App']['ClientEnableTUN']();
+}
+
 export function ClientState() {
   return window['go']['main']['App']['ClientState']();
 }
@@ -148,10 +152,6 @@ export function RemoveUser(arg1, arg2) {
 
 export function ResetUserTraffic(arg1, arg2) {
   return window['go']['main']['App']['ResetUserTraffic'](arg1, arg2);
-}
-
-export function RestartAsAdmin() {
-  return window['go']['main']['App']['RestartAsAdmin']();
 }
 
 export function RestoreBackup(arg1, arg2, arg3, arg4) {

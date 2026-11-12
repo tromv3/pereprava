@@ -63,7 +63,7 @@ func (r *Runner) Start(xray, config, dir string, waitPort int) error {
 	cmd := exec.Command(xray, "run", "-c", config)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+dir)
-	hideWindow(cmd)
+	prepareCmd(cmd)
 	pr, pw := io.Pipe()
 	cmd.Stdout, cmd.Stderr = pw, pw
 	if err := cmd.Start(); err != nil {

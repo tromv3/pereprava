@@ -33,7 +33,7 @@ type ClientRequest struct {
 	Country     string `json:"country"` // сайты этой страны — напрямую; пусто — всё через сервер
 }
 
-// clientSaved — последние настройки клиента в client.json; ссылка зашифрована DPAPI.
+// clientSaved — последние настройки клиента в client.json; ссылка зашифрована (store.Encrypt).
 type clientSaved struct {
 	LinkEnc     string `json:"link"`
 	ServerID    string `json:"serverId"`
@@ -53,7 +53,9 @@ type ClientInfo struct {
 	SystemProxy bool          `json:"systemProxy"`
 	TUN         bool          `json:"tun"`
 	Country     string        `json:"country"`
-	Admin       bool          `json:"admin"`
+	TunReady    bool          `json:"tunReady"`
+	TunHint     string        `json:"tunHint"`
+	OS          string        `json:"os"`
 	Error       string        `json:"error"`
 	Log         []string      `json:"log"`
 	Saved       ClientRequest `json:"saved"`
@@ -69,6 +71,15 @@ type clientState struct {
 }
 
 func (a *App) clientDir() string { return filepath.Join(a.store.Dir(), "client") }
+
+// clientExe — путь к Xray клиента; пусто, если он ещё не скачан.
+func (a *App) clientExe() string {
+	p := filepath.Join(a.clientDir(), client.ExeName)
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
 func (a *App) proxyBackup() string {
 	return filepath.Join(a.clientDir(), "proxy-backup.json")
 }
@@ -90,8 +101,9 @@ func (a *App) ClientState() ClientInfo {
 		Running: cs.runner.Running(), Name: cs.name, Host: cs.host,
 		SocksPort: clientSocksPort, HTTPPort: clientHTTPPort,
 		SystemProxy: cs.running.SystemProxy, TUN: cs.running.TUN, Country: cs.running.Country,
-		Admin: client.IsAdmin(), Error: cs.err, Log: cs.runner.Log(),
+		Error: cs.err, Log: cs.runner.Log(), OS: goruntime.GOOS,
 	}
+	info.TunReady, info.TunHint = client.TunReady(a.clientExe())
 	if saved, err := a.loadClientSaved(); err == nil {
 		info.Saved = saved
 	}
@@ -126,14 +138,16 @@ func (a *App) saveClient(req ClientRequest) error {
 }
 
 // ClientConnect запускает встроенный клиент: локальный Xray с SOCKS5 и HTTP-прокси на 127.0.0.1,
-// по желанию — системный прокси Windows или режим TUN для всего трафика.
+// по желанию — системный прокси или режим TUN для всего трафика.
 func (a *App) ClientConnect(req ClientRequest) error {
 	link, err := client.ParseLink(req.Link)
 	if err != nil {
 		return err
 	}
-	if req.TUN && !client.IsAdmin() {
-		return errors.New("для режима TUN приложение должно работать с правами администратора: нажмите «Перезапустить от администратора»")
+	if req.TUN {
+		if ok, hint := client.TunReady(a.clientExe()); !ok && a.clientExe() != "" {
+			return errors.New(hint + " Нажмите «Дать права для TUN».")
+		}
 	}
 	cs := &a.client
 	if cs.runner.Running() {
@@ -178,7 +192,13 @@ func (a *App) ClientConnect(req ClientRequest) error {
 		runtime.EventsEmit(a.ctx, "client")
 	}
 	cs.mu.Unlock()
-	exe := filepath.Join(dir, "xray.exe")
+	exe := filepath.Join(dir, client.ExeName)
+	if req.TUN {
+		// Xray мог только что скачаться или обновиться: права на сеть у нового файла нужно выдать заново.
+		if ok, hint := client.TunReady(exe); !ok {
+			return errors.New(hint + " Нажмите «Дать права для TUN».")
+		}
+	}
 	if err := cs.runner.Start(exe, cfgPath, dir, clientSocksPort); err != nil {
 		return err
 	}
@@ -208,25 +228,42 @@ func (a *App) ClientDisconnect() {
 	runtime.EventsEmit(a.ctx, "client")
 }
 
-// RestartAsAdmin перезапускает приложение с правами администратора: они нужны режиму TUN.
-func (a *App) RestartAsAdmin() error {
-	if err := client.RestartAsAdmin(); err != nil {
-		return fmt.Errorf("Windows не дала прав администратора: %w", err)
+// ClientEnableTUN даёт права для режима TUN: в Windows перезапускает приложение от администратора,
+// в Linux выдаёт файлу Xray право настраивать сеть (pkexec setcap). Xray сначала скачивается.
+func (a *App) ClientEnableTUN() error {
+	dir := a.clientDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
 	}
-	a.ClientDisconnect()
-	runtime.Quit(a.ctx)
-	return nil
-}
-
-// installClientXray кладёт в dir Xray для Windows (xray.exe, wintun.dll для TUN) и списки сайтов.
-// Xray берётся так же, как для серверов: сохранённый на компьютере или с GitHub.
-// Списки — полные из кэша, если их уже скачивали для серверов, иначе из архива Xray.
-func (a *App) installClientXray(dir string) error {
-	archive, err := a.getXray("windows-" + goruntime.GOARCH)
+	if !a.client.runner.Running() {
+		if err := a.installClientXray(dir); err != nil {
+			return err
+		}
+	}
+	restart, err := client.EnableTUN(filepath.Join(dir, client.ExeName))
 	if err != nil {
 		return err
 	}
-	files, err := xraydist.ExtractNames(archive, []string{"xray.exe", "geoip.dat", "geosite.dat"}, []string{"wintun.dll"})
+	if restart {
+		a.ClientDisconnect()
+		runtime.Quit(a.ctx)
+	}
+	return nil
+}
+
+// installClientXray кладёт в dir Xray для этой системы (в Windows ещё wintun.dll для TUN) и списки сайтов.
+// Xray берётся так же, как для серверов: сохранённый на компьютере или с GitHub.
+// Списки — полные из кэша, если их уже скачивали для серверов, иначе из архива Xray.
+func (a *App) installClientXray(dir string) error {
+	machine := goruntime.GOARCH
+	if goruntime.GOOS == "windows" {
+		machine = "windows-" + machine
+	}
+	archive, err := a.getXray(machine)
+	if err != nil {
+		return err
+	}
+	files, err := xraydist.ExtractNames(archive, []string{client.ExeName, "geoip.dat", "geosite.dat"}, []string{"wintun.dll"})
 	if err != nil {
 		return err
 	}

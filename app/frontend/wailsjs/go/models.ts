@@ -66,7 +66,9 @@ export namespace main {
 	    systemProxy: boolean;
 	    tun: boolean;
 	    country: string;
-	    admin: boolean;
+	    tunReady: boolean;
+	    tunHint: string;
+	    os: string;
 	    error: string;
 	    log: string[];
 	    saved: ClientRequest;
@@ -85,7 +87,9 @@ export namespace main {
 	        this.systemProxy = source["systemProxy"];
 	        this.tun = source["tun"];
 	        this.country = source["country"];
-	        this.admin = source["admin"];
+	        this.tunReady = source["tunReady"];
+	        this.tunHint = source["tunHint"];
+	        this.os = source["os"];
 	        this.error = source["error"];
 	        this.log = source["log"];
 	        this.saved = this.convertValues(source["saved"], ClientRequest);

@@ -34,7 +34,9 @@ type Config struct {
 // UnknownHostError: сервер ещё не подтверждён пользователем.
 type UnknownHostError struct{ Fingerprint, KeyType string }
 
-func (e *UnknownHostError) Error() string { return "неизвестный ключ сервера " + e.Fingerprint }
+func (e *UnknownHostError) Error() string {
+	return "неизвестный ключ сервера " + e.Fingerprint
+}
 
 // HostKeyChangedError: ключ сервера не совпал с сохранённым.
 type HostKeyChangedError struct{ Fingerprint, Expected string }

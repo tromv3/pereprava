@@ -13,7 +13,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-func hideWindow(cmd *exec.Cmd) {
+func prepareCmd(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
 }
 
@@ -167,4 +167,21 @@ func RestoreSystemProxy(backup string) error {
 		return err
 	}
 	return os.Remove(backup)
+}
+
+// ExeName — имя программы Xray в архиве для этой системы.
+const ExeName = "xray.exe"
+
+// TunReady сообщает, можно ли включить TUN, и что для этого сделать.
+func TunReady(xray string) (bool, string) {
+	if IsAdmin() {
+		return true, ""
+	}
+	return false, "Для режима TUN приложение должно работать с правами администратора."
+}
+
+// EnableTUN готовит режим TUN. В Windows — перезапуск приложения от администратора:
+// после успешного вызова приложение надо закрыть (restart = true).
+func EnableTUN(xray string) (restart bool, err error) {
+	return true, RestartAsAdmin()
 }

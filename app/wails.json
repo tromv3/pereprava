@@ -12,7 +12,7 @@
   },
   "info": {
     "productName": "Переправа",
-    "productVersion": "0.5.0",
+    "productVersion": "0.6.0",
     "comments": "Настройка VLESS Reality на своих VPS: мост, выходы и пользователи"
   }
 }
