@@ -27,11 +27,17 @@ export function ChooseBackupOpen():Promise<string>;
 
 export function ChooseBackupSave(arg1:string):Promise<string>;
 
+export function ChooseGeoFiles():Promise<Array<string>>;
+
+export function ChooseXrayFile():Promise<string>;
+
 export function DeleteServer(arg1:string):Promise<void>;
 
 export function ExitLink(arg1:string):Promise<string>;
 
 export function Health(arg1:string):Promise<any>;
+
+export function ImportXray(arg1:string):Promise<string>;
 
 export function InspectBackup(arg1:string):Promise<backup.Header>;
 
@@ -83,8 +89,12 @@ export function Uninstall(arg1:string):Promise<void>;
 
 export function UpdateGeodata(arg1:string):Promise<void>;
 
+export function UpdateGeodataFromFiles(arg1:string,arg2:Array<string>):Promise<void>;
+
 export function UpdateTool(arg1:string):Promise<void>;
 
 export function UpdateXray(arg1:string):Promise<void>;
+
+export function UpdateXrayFromFile(arg1:string,arg2:string):Promise<void>;
 
 export function UseExit(arg1:string,arg2:string):Promise<void>;

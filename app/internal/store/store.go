@@ -67,6 +67,9 @@ func Open(dir string) (*Store, error) {
 	return &Store{path: filepath.Join(dir, "servers.json")}, nil
 }
 
+// Dir — каталог данных приложения.
+func (s *Store) Dir() string { return filepath.Dir(s.path) }
+
 func (s *Store) read() ([]Server, error) {
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {

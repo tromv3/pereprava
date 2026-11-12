@@ -4,6 +4,7 @@ import {
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
   InspectBackup, ListDirect, MigrateUsers, OpenExit, RemoveDirect, ResetUserTraffic, RestoreBackup, SetCountry, SetUserEnabled, SetUserLimit,
   LatestXray, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
+  ChooseGeoFiles, ChooseXrayFile, ImportXray, UpdateGeodataFromFiles, UpdateXrayFromFile,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
 
@@ -385,6 +386,19 @@ function maintenancePanel(server, st) {
   const geoBtn = h('button', {}, 'Обновить списки сайтов');
   geoBtn.addEventListener('click', () => run(geoBtn, () => UpdateGeodata(server.id),
     () => { log.textContent += 'Готово.\n'; }));
+  // Когда GitHub недоступен и с компьютера: файлы, скачанные любым способом.
+  const geoFileBtn = h('button', {}, 'Списки из файлов…');
+  geoFileBtn.addEventListener('click', async () => {
+    let paths;
+    try {
+      paths = await ChooseGeoFiles();
+    } catch (e) {
+      errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+      return;
+    }
+    if (!paths || !paths.length) return;
+    run(geoFileBtn, () => UpdateGeodataFromFiles(server.id, paths), () => { log.textContent += 'Готово.\n'; });
+  });
   const uninstallBtn = h('button', { class: 'danger' }, 'Снять настройку');
   uninstallBtn.addEventListener('click', async () => {
     const lost = st.mode === 'exit'
@@ -410,6 +424,26 @@ function maintenancePanel(server, st) {
         : latest === '' ? 'Последнюю версию узнать не удалось, обновить всё равно можно.'
           : upToDate ? 'Это последняя версия, обновлять не нужно.' : `Можно обновить до ${latest}.`);
   };
+  const xrayFileBtn = h('button', {}, 'Xray из файла…');
+  xrayFileBtn.addEventListener('click', async () => {
+    let path;
+    try {
+      path = await ChooseXrayFile();
+    } catch (e) {
+      errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+      return;
+    }
+    if (!path) return;
+    const ok = await confirmDialog('Поставить Xray из файла?',
+      `Xray из «${path.split(/[\\/]/).pop()}» заменит ${installed || 'текущую версию'}. Если рядом с архивом лежит файл .dgst, архив сверится с ним. Xray перезапустится, у подключённых будет короткий обрыв. Если новая версия не примет настройки или не запустится, вернётся старая.`,
+      'Поставить');
+    if (!ok) return;
+    run(xrayFileBtn, () => UpdateXrayFromFile(server.id, path), async () => {
+      log.textContent += 'Готово.\n';
+      try { installed = xrayVersion((await Status(server.id)).xray.version); } catch { /* останется прежняя */ }
+      showXray();
+    });
+  });
   showXray();
   LatestXray().then((v) => { latest = v; }, () => { latest = ''; }).then(showXray);
   xrayBtn.addEventListener('click', async () => {
@@ -473,6 +507,9 @@ function maintenancePanel(server, st) {
   // Списки сайтов нужны мосту и простому режиму: выход маршрутизацию по ним не делает.
   if (st.mode !== 'exit') buttons.push(geoBtn);
   buttons.push(xrayBtn);
+  const fileButtons = [xrayFileBtn];
+  if (st.mode !== 'exit') fileButtons.unshift(geoFileBtn);
+  buttons.push(...fileButtons);
   if (toolOutdated) buttons.push(toolBtn);
   if (st.mode !== 'exit') buttons.push(saveBtn, restoreBtn);
   buttons.push(uninstallBtn);
@@ -482,7 +519,28 @@ function maintenancePanel(server, st) {
       'Списки сайтов и адресов (geosite, geoip) обычно обновляются на сервере раз в неделю. Если серверу недоступен GitHub, обновляйте их отсюда.'),
     toolOutdated && h('p', { class: 'hint', style: 'margin-bottom:8px' },
       'На сервере старая версия exitctl. Приложению она не мешает, но в консоли сервера будут старые команды.'),
-    h('div', { class: 'row' }, buttons), updateHelp(st), log);
+    h('div', { class: 'row' }, buttons.filter((b) => !fileButtons.includes(b))),
+    h('p', { class: 'hint', style: 'margin:10px 0 6px' },
+      'Если GitHub не отвечает, приложение возьмёт последние Xray и списки, сохранённые на этом компьютере. '
+      + 'Если их нет, скачайте файлы любым способом и выберите их здесь.'),
+    h('div', { class: 'row' }, fileButtons), updateHelp(st), log);
+}
+
+// Кнопка для установки без GitHub: архив Xray сохраняется на компьютере, после чего установку повторяют.
+function xrayImportButton() {
+  const note = h('p', { class: 'hint' });
+  const btn = h('button', { style: 'margin-top:8px' }, 'Xray из файла…');
+  btn.addEventListener('click', async () => {
+    try {
+      const path = await ChooseXrayFile();
+      if (!path) return;
+      const info = await ImportXray(path);
+      note.textContent = `Сохранено на компьютере: ${info}. Нажмите «Установить» ещё раз.`;
+    } catch (e) {
+      note.textContent = msg(e);
+    }
+  });
+  return h('div', {}, btn, note);
 }
 
 // Номер версии из первой строки `xray version`: «Xray 26.11.9 (Xray, ...) ...» → «26.11.9».
@@ -993,6 +1051,7 @@ function installPanel(server, st) {
       openServer(server.id);
     } catch (e) {
       showError(e);
+      if (msg(e).includes('Xray из файла')) errorBox.append(xrayImportButton());
       installBtn.disabled = false;
       scanBtn.disabled = false;
     }

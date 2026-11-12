@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -76,6 +77,9 @@ type App struct {
 	latestMu sync.Mutex
 	latest   string
 	latestAt time.Time
+
+	cache   xraydist.Cache // последние Xray и списки сайтов на этом компьютере
+	logHook func(string)   // для тестов: журнал без окна Wails
 }
 
 // NewApp создаёт приложение.
@@ -89,6 +93,7 @@ func (a *App) startup(ctx context.Context) {
 		return
 	}
 	a.store = s
+	a.cache = xraydist.Cache{Dir: filepath.Join(s.Dir(), "cache")}
 }
 
 func (a *App) shutdown(ctx context.Context) {
@@ -295,7 +300,13 @@ func uploadBundle(ctx context.Context, client *remote.Client) (string, error) {
 	return dir, nil
 }
 
-func (a *App) emit(line string) { runtime.EventsEmit(a.ctx, "log", line) }
+func (a *App) emit(line string) {
+	if a.logHook != nil {
+		a.logHook(line)
+		return
+	}
+	runtime.EventsEmit(a.ctx, "log", line)
+}
 
 // tool запускает exitctl от root. Код выхода 1 с JSON в stdout — обычный результат.
 func (a *App) tool(id string, emit bool, args ...string) (any, error) {
@@ -413,17 +424,124 @@ func (a *App) LatestXray() (string, error) {
 }
 
 // UpdateXray скачивает последний Xray на этом компьютере и ставит его на сервер.
+// Если GitHub не отвечает, берётся копия, сохранённая на компьютере.
 func (a *App) UpdateXray(id string) error {
-	c, err := a.connect(id)
+	c, machine, err := a.connectMachine(id)
 	if err != nil {
 		return err
+	}
+	archive, err := a.getXray(machine)
+	if err != nil {
+		return err
+	}
+	return a.installXray(id, c, archive)
+}
+
+// UpdateXrayFromFile ставит на сервер Xray из выбранного архива (Xray-linux-64.zip и т. п.)
+// и сохраняет архив на компьютере: он пригодится, когда GitHub недоступен.
+func (a *App) UpdateXrayFromFile(id, path string) error {
+	archive, name, meta, err := xraydist.ReadXrayFile(path)
+	if err != nil {
+		return err
+	}
+	c, machine, err := a.connectMachine(id)
+	if err != nil {
+		return err
+	}
+	want, err := xraydist.ArchiveName(machine)
+	if err != nil {
+		return err
+	}
+	if want != name {
+		return fmt.Errorf("архив собран для другой архитектуры: серверу нужен %s, а выбран %s", want, name)
+	}
+	if !meta.Checked {
+		a.emit("Рядом с архивом нет файла .dgst: контрольная сумма не проверена.")
+	}
+	a.saveXray(name, archive, meta)
+	return a.installXray(id, c, archive)
+}
+
+// ImportXray сохраняет выбранный архив Xray на компьютере, ничего не ставя на сервер:
+// так устанавливают закрытый сервер, когда GitHub недоступен и с компьютера.
+func (a *App) ImportXray(path string) (string, error) {
+	archive, name, meta, err := xraydist.ReadXrayFile(path)
+	if err != nil {
+		return "", err
+	}
+	if err := a.cache.SaveXray(name, archive, meta); err != nil {
+		return "", err
+	}
+	return name + ": " + meta.Describe(), nil
+}
+
+// ChooseXrayFile спрашивает архив Xray. Пустая строка — пользователь отменил.
+func (a *App) ChooseXrayFile() (string, error) {
+	return runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title:   "Архив Xray для Linux (Xray-linux-64.zip)",
+		Filters: []runtime.FileFilter{{DisplayName: "Архив Xray (*.zip)", Pattern: "*.zip"}},
+	})
+}
+
+// ChooseGeoFiles спрашивает geoip.dat и geosite.dat. Пустой список — пользователь отменил.
+func (a *App) ChooseGeoFiles() ([]string, error) {
+	return runtime.OpenMultipleFilesDialog(a.ctx, runtime.OpenDialogOptions{
+		Title:   "Списки сайтов: выберите geoip.dat и geosite.dat (или dlc.dat)",
+		Filters: []runtime.FileFilter{{DisplayName: "Списки Xray (*.dat)", Pattern: "*.dat"}},
+	})
+}
+
+func (a *App) connectMachine(id string) (*conn, string, error) {
+	c, err := a.connect(id)
+	if err != nil {
+		return nil, "", err
 	}
 	r, err := c.client.Run(a.ctx, "uname -m", false, nil)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-	a.emit("Скачиваю последний Xray на этом компьютере...")
-	files, err := xraydist.Download(a.ctx, strings.TrimSpace(r.Stdout))
+	return c, strings.TrimSpace(r.Stdout), nil
+}
+
+// getXray возвращает проверенный архив Xray для архитектуры сервера: сохранённый, если он
+// той же версии, что последняя на GitHub; иначе свежий с GitHub; если GitHub не отвечает — сохранённый.
+func (a *App) getXray(machine string) ([]byte, error) {
+	name, err := xraydist.ArchiveName(machine)
+	if err != nil {
+		return nil, err
+	}
+	cached, meta, cacheErr := a.cache.LoadXray(name)
+	latest, latestErr := a.LatestXray()
+	if cacheErr == nil && latestErr == nil && meta.Version == latest {
+		a.emit("Xray " + latest + " уже скачан на этом компьютере.")
+		return cached, nil
+	}
+	if latestErr == nil {
+		a.emit("Скачиваю Xray " + latest + " на этом компьютере...")
+		archive, err := xraydist.DownloadArchive(a.ctx, name)
+		if err == nil {
+			a.saveXray(name, archive, xraydist.Meta{Version: latest, Source: "github", Saved: time.Now(), Checked: true})
+			return archive, nil
+		}
+		latestErr = err
+	}
+	if cacheErr == nil {
+		a.emit(fmt.Sprintf("GitHub не отвечает (%v). Беру Xray, сохранённый на этом компьютере: %s.", latestErr, meta.Describe()))
+		return cached, nil
+	}
+	return nil, fmt.Errorf("%v. На этом компьютере сохранённого Xray тоже нет: скачайте архив %s любым способом "+
+		"(с сайта github.com/XTLS/Xray-core, вместе с %s.dgst, если получится) и выберите его кнопкой «Xray из файла…»", latestErr, name, name)
+}
+
+func (a *App) saveXray(name string, archive []byte, meta xraydist.Meta) {
+	if err := a.cache.SaveXray(name, archive, meta); err != nil {
+		a.emit("Не удалось сохранить Xray на компьютере: " + err.Error())
+	}
+}
+
+// installXray заливает xray из архива на сервер и ставит его через update-xray.sh.
+func (a *App) installXray(id string, c *conn, archive []byte) error {
+	files, err := xraydist.Extract(archive)
 	if err != nil {
 		return err
 	}
@@ -695,8 +813,12 @@ func (a *App) prepareRestricted(c *conn) error {
 		if len(lines) == 0 {
 			return errors.New("не удалось определить архитектуру сервера")
 		}
-		a.emit("Сервер не может скачать Xray с GitHub: скачиваю его на этом компьютере...")
-		files, err := xraydist.Download(a.ctx, lines[len(lines)-1])
+		a.emit("Сервер не может скачать Xray с GitHub: беру его на этом компьютере...")
+		archive, err := a.getXray(lines[len(lines)-1])
+		if err != nil {
+			return err
+		}
+		files, err := xraydist.Extract(archive)
 		if err != nil {
 			return err
 		}
@@ -900,6 +1022,7 @@ func (a *App) Uninstall(id string) error {
 }
 
 // UpdateGeodata скачивает свежие списки сайтов на этом компьютере и ставит их на сервер.
+// Если GitHub не отвечает, берутся списки, сохранённые на компьютере.
 func (a *App) UpdateGeodata(id string) error {
 	c, err := a.connect(id)
 	if err != nil {
@@ -907,9 +1030,45 @@ func (a *App) UpdateGeodata(id string) error {
 	}
 	a.emit("Скачиваю списки сайтов на этом компьютере...")
 	files, err := xraydist.DownloadGeo(a.ctx)
+	if err == nil {
+		a.saveGeo(files, xraydist.Meta{Source: "github", Saved: time.Now(), Checked: true})
+	} else {
+		cached, meta, cacheErr := a.cache.LoadGeo()
+		if cacheErr != nil {
+			return fmt.Errorf("%v. На этом компьютере сохранённых списков тоже нет: скачайте geoip.dat и dlc.dat "+
+				"любым способом (с github.com/v2fly, вместе с файлами .sha256sum, если получится) и выберите их кнопкой «Списки из файлов…»", err)
+		}
+		a.emit(fmt.Sprintf("GitHub не отвечает (%v). Беру списки, сохранённые на этом компьютере: %s.", err, meta.Describe()))
+		files = cached
+	}
+	return a.installGeo(id, c, files)
+}
+
+// UpdateGeodataFromFiles ставит на сервер выбранные geoip.dat и geosite.dat (dlc.dat)
+// и сохраняет их на компьютере.
+func (a *App) UpdateGeodataFromFiles(id string, paths []string) error {
+	files, meta, err := xraydist.ReadGeoFiles(paths)
 	if err != nil {
 		return err
 	}
+	c, err := a.connect(id)
+	if err != nil {
+		return err
+	}
+	if !meta.Checked {
+		a.emit("Не у всех списков рядом лежит файл .sha256sum: их контрольные суммы не проверены.")
+	}
+	a.saveGeo(files, meta)
+	return a.installGeo(id, c, files)
+}
+
+func (a *App) saveGeo(files map[string][]byte, meta xraydist.Meta) {
+	if err := a.cache.SaveGeo(files, meta); err != nil {
+		a.emit("Не удалось сохранить списки на компьютере: " + err.Error())
+	}
+}
+
+func (a *App) installGeo(id string, c *conn, files map[string][]byte) error {
 	dir := c.dir + "/geo"
 	if r, err := c.client.Run(a.ctx, "mkdir -p "+remote.Quote(dir), false, nil); err != nil {
 		return err

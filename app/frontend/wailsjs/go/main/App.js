@@ -50,6 +50,14 @@ export function ChooseBackupSave(arg1) {
   return window['go']['main']['App']['ChooseBackupSave'](arg1);
 }
 
+export function ChooseGeoFiles() {
+  return window['go']['main']['App']['ChooseGeoFiles']();
+}
+
+export function ChooseXrayFile() {
+  return window['go']['main']['App']['ChooseXrayFile']();
+}
+
 export function DeleteServer(arg1) {
   return window['go']['main']['App']['DeleteServer'](arg1);
 }
@@ -60,6 +68,10 @@ export function ExitLink(arg1) {
 
 export function Health(arg1) {
   return window['go']['main']['App']['Health'](arg1);
+}
+
+export function ImportXray(arg1) {
+  return window['go']['main']['App']['ImportXray'](arg1);
 }
 
 export function InspectBackup(arg1) {
@@ -162,12 +174,20 @@ export function UpdateGeodata(arg1) {
   return window['go']['main']['App']['UpdateGeodata'](arg1);
 }
 
+export function UpdateGeodataFromFiles(arg1, arg2) {
+  return window['go']['main']['App']['UpdateGeodataFromFiles'](arg1, arg2);
+}
+
 export function UpdateTool(arg1) {
   return window['go']['main']['App']['UpdateTool'](arg1);
 }
 
 export function UpdateXray(arg1) {
   return window['go']['main']['App']['UpdateXray'](arg1);
+}
+
+export function UpdateXrayFromFile(arg1, arg2) {
+  return window['go']['main']['App']['UpdateXrayFromFile'](arg1, arg2);
 }
 
 export function UseExit(arg1, arg2) {

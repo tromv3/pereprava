@@ -152,6 +152,15 @@ func Download(ctx context.Context, machine string) (map[string][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	archive, err := DownloadArchive(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	return Extract(archive)
+}
+
+// DownloadArchive скачивает архив Xray name и сверяет его с .dgst.
+func DownloadArchive(ctx context.Context, name string) ([]byte, error) {
 	archive, err := fetch(ctx, BaseURL+"/"+name)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось скачать Xray: %w", err)
@@ -163,7 +172,10 @@ func Download(ctx context.Context, machine string) (map[string][]byte, error) {
 	if err := Verify(archive, string(dgst)); err != nil {
 		return nil, err
 	}
-	return Extract(archive)
+	if _, err := Extract(archive); err != nil {
+		return nil, err
+	}
+	return archive, nil
 }
 
 var reTag = regexp.MustCompile(`/tag/v?([0-9][0-9A-Za-z.\-]*)$`)
