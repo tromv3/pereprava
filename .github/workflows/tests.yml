@@ -46,3 +46,22 @@ jobs:
         run: mkdir -p frontend/dist && echo '<!doctype html>' > frontend/dist/index.html
       - run: go vet ./...
       - run: go test ./... -count=1
+
+  app-linux:
+    name: Приложение (Go, Linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+      - name: GTK и WebKitGTK для Wails
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgtk-3-dev libwebkit2gtk-4.1-dev >/dev/null
+      - name: Заглушка собранного интерфейса для go:embed
+        run: mkdir -p frontend/dist && echo '<!doctype html>' > frontend/dist/index.html
+      - run: go vet -tags webkit2_41 ./...
+      - run: go test -tags webkit2_41 ./... -count=1
