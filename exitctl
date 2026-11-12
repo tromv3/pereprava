@@ -29,6 +29,7 @@
   exitctl status [--json]                          состояние сервера и Xray
   exitctl health [--json]                          проблемы сервера: Xray, выходы, сертификат SNI, исходящий трафик (код 1 — есть проблемы)
   exitctl exit open [--json]                       выход — ещё и для клиентов (на выходе; ссылка моста не меняется)
+  exitctl exit close [--json]                      закрыть выход для клиентов: снова только мост (пользователи сохраняются до open)
   exitctl reach <адрес> <порт> [--json]            достаёт ли этот сервер до адреса (код 1 — нет)
   exitctl migrate export                           пользователи, ключи Reality, выходы и сайты напрямую (JSON)
   exitctl migrate import <файл> [--keys] [--json]  добавить их сюда; --keys заменяет ключи Reality
@@ -80,6 +81,8 @@ EGRESS_HOSTS = EGRESS_FOREIGN + ("ya.ru",)
 EXIT_CONF = os.environ.get("XRAY_EXIT_CONF", "/usr/local/etc/xray/config.json")
 INSTALLED_TOOL = os.environ.get("EXITCTL_INSTALLED", "/usr/local/bin/exitctl")
 DROPIN = os.environ.get("EXITCTL_DROPIN", "/etc/systemd/system/xray.service.d/99-confdir.conf")
+# Куда exit close убирает конфиг открытого выхода: повторный exit open вернёт пользователей.
+CLOSED_DIR = os.environ.get("XRAY_CLOSED_DIR", CONF_DIR.rstrip("/") + ".closed")
 BRIDGE_USER = "bridge"  # мост на выходе, открытом для клиентов (exitctl exit open)
 RE_SERVICE = re.compile(
     r"(^|[.-])(mail|smtp|imap|pop3?|mx|ns|dns|ftp|cpanel|whm|webmail|autodiscover|autoconfig"
@@ -1740,6 +1743,7 @@ def exit_open():
     if os.path.exists(BASE):
         die("этот сервер уже настроен как мост или простой сервер")
     conf = load(EXIT_CONF)
+    restored = closed_config(conf)
     try:
         ib = json.loads(json.dumps(conf["inbounds"][0]))
         ib["streamSettings"]["realitySettings"]["privateKey"]
@@ -1763,6 +1767,8 @@ def exit_open():
     os.makedirs(CONF_DIR, exist_ok=True)
 
     def undo(msg):
+        if restored:
+            move_json(CONF_DIR, CLOSED_DIR)
         for p in (BASE, EXITS, DROPIN):
             with contextlib.suppress(OSError):
                 os.remove(p)
@@ -1770,8 +1776,14 @@ def exit_open():
         subprocess.run(["systemctl", "restart", "xray"], capture_output=True)
         die(msg + " Выход возвращён к прежнему конфигу.")
 
-    save(BASE, base)
-    save(EXITS, {"outbounds": []})
+    if restored:
+        # Выход уже был открыт и закрыт: возвращаем его конфиг вместе с пользователями.
+        move_json(CLOSED_DIR, CONF_DIR)
+        ib = load(BASE)["inbounds"][0]
+        clients = ib["settings"]["clients"]
+    else:
+        save(BASE, base)
+        save(EXITS, {"outbounds": []})
     test = subprocess.run([XRAY, "run", "-test", "-confdir", CONF_DIR], capture_output=True, text=True)
     if test.returncode != 0:
         out = (test.stdout + test.stderr).strip().splitlines()
@@ -1791,21 +1803,98 @@ def exit_open():
     with contextlib.suppress(OSError):
         shutil.copy(os.path.abspath(__file__), INSTALLED_TOOL)
         os.chmod(INSTALLED_TOOL, 0o755)
-    return {"port": ib["port"], "users": [client_name(c) for c in clients]}
+    return {"port": ib["port"], "users": [client_name(c) for c in clients], "restored": bool(restored)}
+
+
+def move_json(src, dst):
+    """Переносит конфиги (*.json) из src в dst; dst создаётся, старые файлы в нём заменяются."""
+    os.makedirs(dst, exist_ok=True)
+    for name in os.listdir(dst):
+        path = os.path.join(dst, name)
+        if name.endswith(".json") and os.path.abspath(path) not in (os.path.abspath(EXIT_CONF), os.path.abspath(USERS_META)):
+            os.remove(path)
+    keep = {os.path.abspath(EXIT_CONF), os.path.abspath(USERS_META)}  # на случай, если они лежат там же
+    for name in os.listdir(src):
+        path = os.path.join(src, name)
+        if name.endswith(".json") and os.path.abspath(path) not in keep:
+            shutil.move(path, os.path.join(dst, name))
+
+
+def closed_config(exit_conf):
+    """Конфиг, убранный exit close, если он от этого же выхода: тот же UUID моста и ключ Reality."""
+    path = os.path.join(CLOSED_DIR, "00_base.json")
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path) as f:
+            old = json.load(f)
+        ib, cur = old["inbounds"][0], exit_conf["inbounds"][0]
+        bridge = next(c for c in ib["settings"]["clients"] if client_name(c) == BRIDGE_USER)
+        same = (bridge["id"] == cur["settings"]["clients"][0]["id"]
+                and ib["streamSettings"]["realitySettings"]["privateKey"] == cur["streamSettings"]["realitySettings"]["privateKey"])
+    except (OSError, ValueError, KeyError, IndexError, TypeError, StopIteration, SystemExit):
+        return False
+    return same
+
+
+def exit_close():
+    """Выход снова только для моста: Xray возвращается к config.json, порт закрывается для всех,
+    кроме моста. Конфиг с пользователями убирается в CLOSED_DIR, повторный exit open вернёт его."""
+    if not os.path.exists(BASE) or not os.path.exists(EXIT_CONF):
+        die("это не выход, открытый для клиентов (exitctl exit open)")
+    base = load(BASE)
+    ib = base["inbounds"][0]
+    if not any(client_name(c) == BRIDGE_USER for c in ib["settings"]["clients"]):
+        die("это не выход, открытый для клиентов: в нём нет пользователя «bridge»")
+    others = [client_name(c) for c in ib["settings"]["clients"] if client_name(c) != BRIDGE_USER]
+    meta = load_meta()
+    if not NO_RESTART and collect_traffic(meta):
+        save_meta(meta)
+    move_json(CONF_DIR, CLOSED_DIR)
+    with contextlib.suppress(OSError):
+        os.remove(DROPIN)
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    if not NO_RESTART:
+        subprocess.run(["systemctl", "restart", "xray"], capture_output=True)
+        time.sleep(1)
+        if run_text("systemctl", "is-active", "xray") != "active":
+            # Возвращаем открытый выход: лучше он, чем выход, который не работает совсем.
+            move_json(CLOSED_DIR, CONF_DIR)
+            os.makedirs(os.path.dirname(DROPIN), exist_ok=True)
+            with open(DROPIN, "w") as f:
+                f.write(f"[Service]\nExecStart=\nExecStart={XRAY} run -confdir {CONF_DIR}\n")
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+            subprocess.run(["systemctl", "restart", "xray"], capture_output=True)
+            die("Xray с конфигом выхода не запустился, выход оставлен открытым.")
+    subprocess.run(["ufw", "delete", "allow", f'{ib["port"]}/tcp'], capture_output=True)
+    with contextlib.suppress(OSError):
+        os.remove(CRON_FILE)
+    rules = run_text("ufw", "status") or ""
+    bridge_rule = any(str(ib["port"]) in line and "ALLOW" in line and "Anywhere" not in line.split("ALLOW", 1)[1]
+                      for line in rules.splitlines())
+    return {"port": ib["port"], "closed_users": others, "bridge_rule": bridge_rule}
 
 
 def cmd_exit(a):
     as_json = "--json" in a
     a = [x for x in a if x != "--json"]
-    if a != ["open"]:
-        die("используйте: exitctl exit open [--json]")
+    if a not in (["open"], ["close"]):
+        die("используйте: exitctl exit open|close [--json]")
     with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
-        rep = exit_open()
+        rep = exit_open() if a == ["open"] else exit_close()
     if as_json:
         print(json.dumps(rep, ensure_ascii=False, indent=2))
-    else:
+    elif a == ["open"]:
+        again = " Пользователи, бывшие до закрытия, вернулись." if rep["restored"] else ""
         print(f'Выход открыт для клиентов: порт {rep["port"]} доступен всем. Мост — пользователь «{BRIDGE_USER}», '
-              "его ссылка не изменилась. Пользователи: exitctl user add ...")
+              f"его ссылка не изменилась.{again} Пользователи: exitctl user add ...")
+    else:
+        lost = ", ".join(rep["closed_users"]) or "нет"
+        print(f'Выход закрыт для клиентов: порт {rep["port"]} снова только для моста. '
+              f"Отключены: {lost}; exitctl exit open вернёт их с прежними ссылками.")
+        if not rep["bridge_rule"]:
+            print(f'Внимание: в ufw не видно правила для моста на порт {rep["port"]}. '
+                  f'Добавьте: ufw allow from IP_МОСТА to any port {rep["port"]}')
 
 
 def reach_report(host, port):

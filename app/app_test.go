@@ -72,7 +72,7 @@ func TestParsePoll(t *testing.T) {
 }
 
 func TestJobScript(t *testing.T) {
-	s := jobScript("/tmp/d/update-xray.sh", " '/tmp/d/x'", "/tmp/d/job")
+	s := jobScript("bash '/tmp/d/update-xray.sh' '/tmp/d/x'", "/tmp/d/job")
 	want := "#!/bin/bash\nbash '/tmp/d/update-xray.sh' '/tmp/d/x' >'/tmp/d/job.log' 2>&1\n" +
 		"echo $? >'/tmp/d/job.rc.tmp'\nmv '/tmp/d/job.rc.tmp' '/tmp/d/job.rc'\n"
 	if s != want {

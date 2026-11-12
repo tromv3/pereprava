@@ -697,11 +697,24 @@ func (a *App) ListDirect(id string) (any, error) {
 
 // OpenExit открывает выход и для клиентов (exitctl exit open): раскладка простого режима с теми же ключами,
 // мост становится пользователем bridge, его ссылка не меняется, порт 443 открывается всем.
-func (a *App) OpenExit(id string) (any, error) {
+// Если выход уже открывали и закрывали, возвращаются прежние пользователи.
+func (a *App) OpenExit(id string) error { return a.exitCommand(id, "open", "открыть выход не удалось") }
+
+// CloseExit закрывает выход для клиентов (exitctl exit close): снова только мост,
+// пользователи сохраняются на сервере до следующего OpenExit.
+func (a *App) CloseExit(id string) error { return a.exitCommand(id, "close", "закрыть выход не удалось") }
+
+// exitCommand запускает exitctl exit отдельно от SSH: Xray перезапускается, и если компьютер
+// ходит на сервер через этот выход, связь рвётся посреди команды.
+func (a *App) exitCommand(id, action, failMsg string) error {
 	if err := a.ensurePython(id); err != nil {
-		return nil, err
+		return err
 	}
-	return a.tool(id, true, "exit", "open", "--json")
+	c, err := a.connect(id)
+	if err != nil {
+		return err
+	}
+	return a.runDetachedCmd(id, c, "PYTHONUTF8=1 python3 "+remote.Quote(c.dir+"/exitctl")+" exit "+action, failMsg)
 }
 
 // ListBuiltin возвращает встроенные списки «напрямую» моста: {domains, ips}.
@@ -894,9 +907,14 @@ func (a *App) runScript(c *conn, script, args, failMsg string) error {
 // Скрипты, перезапускающие Xray, обрывают SSH, если компьютер ходит на сервер через этот же Xray:
 // тогда приложение переподключается и дочитывает журнал и код выхода.
 func (a *App) runDetached(id string, c *conn, script, args, failMsg string) error {
+	return a.runDetachedCmd(id, c, "bash "+remote.Quote(c.dir+"/"+script)+args, failMsg)
+}
+
+// runDetachedCmd — то же для любой команды оболочки: она выполняется от root.
+func (a *App) runDetachedCmd(id string, c *conn, command, failMsg string) error {
 	unit := "pereprava-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	job := c.dir + "/" + unit
-	if err := c.client.Upload(a.ctx, job+".sh", []byte(jobScript(c.dir+"/"+script, args, job)), "700"); err != nil {
+	if err := c.client.Upload(a.ctx, job+".sh", []byte(jobScript(command, job)), "700"); err != nil {
 		return err
 	}
 	r, err := c.client.Run(a.ctx, "systemd-run --quiet --collect --unit="+unit+" /bin/bash "+remote.Quote(job+".sh"), true, nil)
@@ -974,9 +992,9 @@ func (a *App) reconnect(id string, deadline time.Time) (*conn, error) {
 const pollMark = "@@pereprava-log@@"
 
 // jobScript — обёртка для systemd-run: журнал в .log, код выхода в .rc (атомарно, через .tmp).
-func jobScript(script, args, job string) string {
+func jobScript(command, job string) string {
 	return "#!/bin/bash\n" +
-		"bash " + remote.Quote(script) + args + " >" + remote.Quote(job+".log") + " 2>&1\n" +
+		command + " >" + remote.Quote(job+".log") + " 2>&1\n" +
 		"echo $? >" + remote.Quote(job+".rc.tmp") + "\n" +
 		"mv " + remote.Quote(job+".rc.tmp") + " " + remote.Quote(job+".rc") + "\n"
 }

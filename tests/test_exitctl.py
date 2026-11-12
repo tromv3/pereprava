@@ -45,6 +45,8 @@ def fake_run(cmd, **k):
         r.stdout = "Xray 26.1.1 (Xray, Penetrates Everything.)\nmore"
     elif cmd[0] == "systemctl":
         r.stdout = "active"
+    elif cmd[:2] == ["ufw", "status"]:
+        r.stdout = mode.get("ufw", "")
     return r
 ex.subprocess.run = fake_run
 ex.detect_server_ip = lambda: "203.0.113.9"
@@ -647,6 +649,31 @@ for act in (["remove", "bridge"], ["disable", "bridge"], ["limit", "bridge", "--
 c, o, e = cli("user", "add", "phone", "--json")
 expect("на открытом выходе добавляются пользователи", c == 0 and {u["name"] for u in json.loads(cli("user", "list", "--json")[1])} == {"bridge", "phone"}, (o, e))
 expect("exit без open — подсказка", cli("exit")[0] == 1)
+
+# --- exitctl exit close: обратно только для моста, пользователи ждут повторного open
+ex.CLOSED_DIR = os.path.join(tmp, "closed")
+mode["ufw"] = ("Status: active\n443                        ALLOW       198.51.100.7\n"
+               "443/tcp                    ALLOW       Anywhere\n")
+c, o, e = cli("exit", "close", "--json")
+r = json.loads(o) if c == 0 else {}
+expect("exit close: закрыт, отключён phone", c == 0 and r.get("closed_users") == ["phone"] and r.get("bridge_rule") is True, (o, e))
+expect("exit close: снова выход", json.loads(cli("status", "--json")[1])["mode"] == "exit"
+       and not os.path.exists(os.path.join(tmp, "00_base.json")) and not os.path.exists(ex.DROPIN) and not os.path.exists(cron_path))
+expect("exit close: конфиг выхода и учёт на месте", json.load(open(ex.EXIT_CONF)) == exit_conf and os.path.exists(meta_path)
+       and os.path.exists(os.path.join(ex.CLOSED_DIR, "00_base.json")))
+expect("exit close повторно — отказ", cli("exit", "close")[0] == 1)
+c, o, e = cli("exit", "open", "--json")
+r = json.loads(o) if c == 0 else {}
+expect("exit open после close: пользователи вернулись", c == 0 and r.get("restored") is True and set(r.get("users", [])) == {"bridge", "phone"}, (o, e))
+mode["ufw"] = "Status: active\n443/tcp                    ALLOW       Anywhere\n"
+c, o, e = cli("exit", "close")
+expect("exit close: нет правила для моста — предупреждение", c == 0 and "ufw allow from" in o, o)
+closed = json.load(open(os.path.join(ex.CLOSED_DIR, "00_base.json")))
+closed["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "OTHER"
+open(os.path.join(ex.CLOSED_DIR, "00_base.json"), "w").write(json.dumps(closed))
+c, o, e = cli("exit", "open", "--json")
+r = json.loads(o) if c == 0 else {}
+expect("exit open: чужой закрытый конфиг не возвращается", c == 0 and r.get("restored") is False and r.get("users") == ["bridge"], (o, e))
 
 shutil.rmtree(tmp, ignore_errors=True)
 print("Всего:", len(res), "ошибок:", res.count(False))

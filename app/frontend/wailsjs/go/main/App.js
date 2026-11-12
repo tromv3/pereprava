@@ -58,6 +58,10 @@ export function ChooseXrayFile() {
   return window['go']['main']['App']['ChooseXrayFile']();
 }
 
+export function CloseExit(arg1) {
+  return window['go']['main']['App']['CloseExit'](arg1);
+}
+
 export function DeleteServer(arg1) {
   return window['go']['main']['App']['DeleteServer'](arg1);
 }

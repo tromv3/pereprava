@@ -31,6 +31,8 @@ export function ChooseGeoFiles():Promise<Array<string>>;
 
 export function ChooseXrayFile():Promise<string>;
 
+export function CloseExit(arg1:string):Promise<void>;
+
 export function DeleteServer(arg1:string):Promise<void>;
 
 export function ExitLink(arg1:string):Promise<string>;
@@ -57,7 +59,7 @@ export function ListUsers(arg1:string):Promise<any>;
 
 export function MigrateUsers(arg1:string,arg2:string,arg3:boolean):Promise<any>;
 
-export function OpenExit(arg1:string):Promise<any>;
+export function OpenExit(arg1:string):Promise<void>;
 
 export function QRCode(arg1:string):Promise<string>;
 

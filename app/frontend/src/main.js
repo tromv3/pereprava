@@ -2,7 +2,7 @@ import './style.css';
 import {
   AddDirect, AddExit, AddUser, AllowBridgeOnExit, BackupServer, ChooseBackupOpen, ChooseBackupSave, AutoExit, ChangeBuiltin, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Health, Install, ListBuiltin, ListExits,
   ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
-  InspectBackup, ListDirect, MigrateUsers, OpenExit, RemoveDirect, ResetUserTraffic, RestoreBackup, SetCountry, SetUserEnabled, SetUserLimit,
+  CloseExit, InspectBackup, ListDirect, MigrateUsers, OpenExit, RemoveDirect, ResetUserTraffic, RestoreBackup, SetCountry, SetUserEnabled, SetUserLimit,
   LatestXray, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
   ChooseGeoFiles, ChooseXrayFile, ImportXray, UpdateGeodataFromFiles, UpdateXrayFromFile,
 } from '../wailsjs/go/main/App';
@@ -749,30 +749,54 @@ function exitInfoPanel(server, st) {
     box.replaceChildren(h('p', { class: 'link' }, link), h('div', { class: 'row' },
       h('button', { onclick: (e) => { ClipboardSetText(link); e.target.textContent = 'Скопировано'; } }, 'Копировать')));
   }).catch((e) => box.replaceChildren(h('div', { class: 'error' }, msg(e))));
-  if (st.bridge_user) {
-    return h('div', { class: 'panel' }, h('h3', {}, 'Выход: ссылка для моста'),
-      h('p', { class: 'hint', style: 'margin-bottom:8px' },
-        'Этот выход открыт и для клиентов. Мост подключается к нему как пользователь «bridge»: не удаляйте и не отключайте его. Ссылка для моста прежняя.'), box);
-  }
   const errorBox = h('div');
   const log = h('div', { class: 'log', hidden: true });
+  // Открытие и закрытие перезапускают Xray; журнал остаётся на экране, если в нём есть предупреждение.
+  const act = async (btn, fn) => {
+    errorBox.replaceChildren();
+    log.hidden = false;
+    log.textContent = '';
+    logTarget = log;
+    btn.disabled = true;
+    try {
+      await fn();
+      if (!log.textContent.includes('Внимание')) {
+        openServer(server.id);
+        return;
+      }
+      errorBox.replaceChildren(h('div', { class: 'notice' }, 'Готово, но посмотрите предупреждение в журнале ниже. ',
+        h('button', { class: 'link-btn', onclick: () => openServer(server.id) }, 'Обновить страницу')));
+    } catch (e) {
+      errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+      btn.disabled = false;
+    }
+  };
+
+  if (st.bridge_user) {
+    const closeBtn = h('button', {}, 'Закрыть выход для клиентов…');
+    closeBtn.addEventListener('click', async () => {
+      const ok = await confirmDialog('Закрыть выход для клиентов?',
+        'Порт 443 снова будет открыт только для моста, а мост продолжит работать через этот выход как раньше. '
+        + 'Остальные пользователи перестанут подключаться, но их ссылки, сроки и накопленный трафик сохранятся на сервере: '
+        + 'если открыть выход снова, они вернутся с прежними ссылками. Xray один раз перезапустится.',
+        'Закрыть');
+      if (ok) act(closeBtn, () => CloseExit(server.id));
+    });
+    return h('div', { class: 'panel' }, h('h3', {}, 'Выход: ссылка для моста'), errorBox,
+      h('p', { class: 'hint', style: 'margin-bottom:8px' },
+        'Этот выход открыт и для клиентов. Мост подключается к нему как пользователь «bridge»: не удаляйте и не отключайте его. Ссылка для моста прежняя.'), box,
+      h('div', { style: 'margin-top:12px' }, closeBtn,
+        h('p', { class: 'hint' }, 'Чтобы к выходу снова подключался только мост.')), log);
+  }
   const openBtn = h('button', {}, 'Открыть выход и для клиентов…');
   openBtn.addEventListener('click', async () => {
     const ok = await confirmDialog('Открыть выход для клиентов?',
       'Клиенты смогут подключаться к этому серверу напрямую, без моста, а мост продолжит работать через него как раньше: его ссылка не изменится. '
       + 'Порт 443 откроется для всех, а на сервере появятся пользователи, сроки, лимиты и счётчики трафика, как в простом режиме; мост станет пользователем «bridge». '
+      + 'Если выход уже открывали и закрывали, вернутся прежние пользователи с прежними ссылками. '
       + 'Учтите: чем больше клиентов знают адрес выхода, тем выше шанс, что его заметят и заблокируют, и тогда мост тоже потеряет этот выход. Xray один раз перезапустится.',
       'Открыть');
-    if (!ok) return;
-    errorBox.replaceChildren();
-    openBtn.disabled = true;
-    try {
-      await OpenExit(server.id);
-      openServer(server.id);
-    } catch (e) {
-      errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
-      openBtn.disabled = false;
-    }
+    if (ok) act(openBtn, () => OpenExit(server.id));
   });
   return h('div', { class: 'panel' }, h('h3', {}, 'Выход: ссылка для моста'), errorBox,
     h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'Порт 443 этого сервера открыт только для адреса моста, указанного при установке.'), box,
