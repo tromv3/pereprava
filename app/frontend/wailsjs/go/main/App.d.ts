@@ -51,7 +51,7 @@ export function ImportXray(arg1:string):Promise<string>;
 
 export function InspectBackup(arg1:string):Promise<backup.Header>;
 
-export function Install(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<void>;
+export function Install(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:number):Promise<void>;
 
 export function LatestXray():Promise<string>;
 

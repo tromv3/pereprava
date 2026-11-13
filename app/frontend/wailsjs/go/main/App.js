@@ -98,8 +98,8 @@ export function InspectBackup(arg1) {
   return window['go']['main']['App']['InspectBackup'](arg1);
 }
 
-export function Install(arg1, arg2, arg3, arg4, arg5) {
-  return window['go']['main']['App']['Install'](arg1, arg2, arg3, arg4, arg5);
+export function Install(arg1, arg2, arg3, arg4, arg5, arg6) {
+  return window['go']['main']['App']['Install'](arg1, arg2, arg3, arg4, arg5, arg6);
 }
 
 export function LatestXray() {

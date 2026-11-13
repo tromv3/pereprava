@@ -30,6 +30,7 @@
   exitctl health [--json]                          проблемы сервера: Xray, выходы, сертификат SNI, исходящий трафик (код 1 — есть проблемы)
   exitctl exit open [--json]                       выход — ещё и для клиентов (на выходе; ссылка моста не меняется)
   exitctl exit close [--json]                      закрыть выход для клиентов: снова только мост (пользователи сохраняются до open)
+  exitctl exit allow <IP моста> [--json]           пустить мост на порт выхода (правило ufw)
   exitctl reach <адрес> <порт> [--json]            достаёт ли этот сервер до адреса (код 1 — нет)
   exitctl migrate export                           пользователи, ключи Reality, выходы и сайты напрямую (JSON)
   exitctl migrate import <файл> [--keys] [--json]  добавить их сюда; --keys заменяет ключи Reality
@@ -83,6 +84,10 @@ INSTALLED_TOOL = os.environ.get("EXITCTL_INSTALLED", "/usr/local/bin/exitctl")
 DROPIN = os.environ.get("EXITCTL_DROPIN", "/etc/systemd/system/xray.service.d/99-confdir.conf")
 # Куда exit close убирает конфиг открытого выхода: повторный exit open вернёт пользователей.
 CLOSED_DIR = os.environ.get("XRAY_CLOSED_DIR", CONF_DIR.rstrip("/") + ".closed")
+# Файл состояния установщиков: чем владеет установка (правила ufw, был ли Xray до неё).
+STATE = os.environ.get("XRAY_STATE", "/usr/local/etc/xray/pereprava.state")
+INFO_FILES = [os.path.join(os.environ.get("EXITCTL_INFO_DIR", "/root"), n)
+              for n in ("bridge-info.txt", "exit-info.txt", "simple-info.txt")]
 BRIDGE_USER = "bridge"  # мост на выходе, открытом для клиентов (exitctl exit open)
 RE_SERVICE = re.compile(
     r"(^|[.-])(mail|smtp|imap|pop3?|mx|ns|dns|ftp|cpanel|whm|webmail|autodiscover|autoconfig"
@@ -1578,6 +1583,91 @@ def file_sha256(path):
         return None
 
 
+def is_ours():
+    """Наша ли установка Xray: файл состояния, конфиг моста или ссылки прошлых версий установщиков."""
+    return os.path.exists(STATE) or os.path.exists(BASE) or any(os.path.exists(f) for f in INFO_FILES)
+
+
+def foreign_xray():
+    """На сервере Xray с чужими настройками: установка его бы перенастроила."""
+    if is_ours():
+        return False
+    try:
+        with open(EXIT_CONF) as f:
+            text = f.read()
+        if re.sub(r"\s", "", text) not in ("", "{}"):
+            return True
+    except OSError:
+        pass
+    names = os.listdir(CONF_DIR) if os.path.isdir(CONF_DIR) else []
+    if any(n.endswith(".json") and os.path.abspath(os.path.join(CONF_DIR, n)) != os.path.abspath(EXIT_CONF) for n in names):
+        return True
+    return run_text("systemctl", "is-active", "xray") == "active"
+
+
+def listening():
+    """Порты, которые слушают программы: [{port, proto, process, local}]. local — только адреса
+    этого компьютера: снаружи порт не виден, но занять его Xray всё равно не сможет."""
+    out = []
+    seen = set()
+    for proto, flag in (("tcp", "-ltnpH"), ("udp", "-lunpH")):
+        for line in (run_text("ss", flag) or "").splitlines():
+            f = line.split()
+            if len(f) < 5:
+                continue
+            addr, _, port = f[3].rpartition(":")
+            if not port.isdigit():
+                continue
+            local = addr.startswith("127.") or addr in ("[::1]", "[::ffff:127.0.0.1]") or addr.endswith("%lo")
+            m = re.search(r'users:\(\("([^"]+)"', line)
+            key = (proto, int(port))
+            if key in seen:
+                # тот же порт и на внешнем адресе: значит, он не только локальный
+                if not local:
+                    next(x for x in out if (x["proto"], x["port"]) == key)["local"] = False
+                continue
+            seen.add(key)
+            out.append({"port": int(port), "proto": proto, "process": m.group(1) if m else None, "local": local})
+    return sorted(out, key=lambda x: (x["proto"], x["port"]))
+
+
+def ufw_status():
+    """active, inactive или None, если ufw не установлен."""
+    st = run_text("ufw", "status")
+    if st is None:
+        return None
+    return "active" if st.startswith("Status: active") else "inactive"
+
+
+def state_lines():
+    return (read_file(STATE) or "").splitlines()
+
+
+def ufw_add(args):
+    """ufw allow args. Правило записывается в файл состояния как наше, только если ufw его добавил."""
+    r = subprocess.run(["ufw", "allow", *args], capture_output=True, text=True)
+    rec = "ufw=" + " ".join(args)
+    # Включённый ufw отвечает «Rule added», выключенный — «Rules updated»; «Skipping» — правило уже было.
+    added = r.returncode == 0 and "Skipping" not in (r.stdout or "")
+    if added and rec not in state_lines():
+        with open(STATE, "a") as f:
+            f.write(rec + "\n")
+    return r.returncode == 0, added
+
+
+def ufw_remove(args):
+    """Убирает правило ufw, если его добавила установка. Без файла состояния (старые установки) — как раньше."""
+    rec = "ufw=" + " ".join(args)
+    lines = state_lines()
+    if os.path.exists(STATE) and rec not in lines:
+        return False
+    subprocess.run(["ufw", "--force", "delete", "allow", *args], capture_output=True)
+    if os.path.exists(STATE):
+        with open(STATE, "w") as f:
+            f.write("".join(x + "\n" for x in lines if x != rec))
+    return True
+
+
 def status_report():
     meminfo = dict(re.findall(r"^(\w+):\s+(\d+) kB", read_file("/proc/meminfo") or "", re.M))
     mem_total, mem_avail = meminfo.get("MemTotal"), meminfo.get("MemAvailable")
@@ -1606,6 +1696,7 @@ def status_report():
         "installed": os.path.exists(BASE),
         "tool_sha256": file_sha256(INSTALLED_TOOL),
         "mode": None, "sni": None, "port": None, "users": None, "exits": None, "bridge_user": False,
+        "foreign_xray": False, "listening": listening(), "ufw": ufw_status(),
     }
     if rep["installed"]:
         base, ex = load(BASE), load(EXITS, {"outbounds": []})
@@ -1617,6 +1708,9 @@ def status_report():
         # Выход, открытый для клиентов: простой режим, где один из пользователей — мост.
         rep["bridge_user"] = any(client_name(c) == BRIDGE_USER for c in ib["settings"]["clients"])
         rep["exits"] = len(exits_list(ex))
+    elif foreign_xray():
+        # Чужой Xray: не показываем его как наш выход и не даём ставить поверх.
+        rep["foreign_xray"] = True
     elif os.path.exists(EXIT_CONF):
         # Выход настроен exit-setup.sh: один config.json. Установщик Xray кладёт сюда пустой {}.
         try:
@@ -1797,8 +1891,8 @@ def exit_open():
         time.sleep(1)
         if run_text("systemctl", "is-active", "xray") != "active":
             undo("Xray с новым конфигом не запустился.")
-    # Порт 443 — всем: раньше он был открыт только мосту.
-    subprocess.run(["ufw", "allow", f'{ib["port"]}/tcp'], capture_output=True)
+    # Порт — всем: раньше он был открыт только мосту. Правило записывается как наше.
+    ufw_add([f'{ib["port"]}/tcp'])
     ensure_cron()
     with contextlib.suppress(OSError):
         shutil.copy(os.path.abspath(__file__), INSTALLED_TOOL)
@@ -1866,7 +1960,7 @@ def exit_close():
             subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
             subprocess.run(["systemctl", "restart", "xray"], capture_output=True)
             die("Xray с конфигом выхода не запустился, выход оставлен открытым.")
-    subprocess.run(["ufw", "delete", "allow", f'{ib["port"]}/tcp'], capture_output=True)
+    ufw_remove([f'{ib["port"]}/tcp'])
     with contextlib.suppress(OSError):
         os.remove(CRON_FILE)
     rules = run_text("ufw", "status") or ""
@@ -1875,11 +1969,42 @@ def exit_close():
     return {"port": ib["port"], "closed_users": others, "bridge_rule": bridge_rule}
 
 
+def exit_port():
+    """Порт выхода: из открытого для клиентов конфига или из config.json."""
+    try:
+        if os.path.exists(BASE):
+            return int(inbound_in(load(BASE))["port"])
+        return int(load(EXIT_CONF)["inbounds"][0]["port"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        die("не удалось узнать порт выхода из конфига")
+
+
+def exit_allow(ip):
+    """Пускает мост ip на порт выхода правилом ufw."""
+    try:
+        if ipaddress.ip_address(ip).version != 4:
+            raise ValueError
+    except ValueError:
+        die(f"{ip} — не IPv4-адрес")
+    port = exit_port()
+    ok, added = ufw_add(["from", ip, "to", "any", "port", str(port), "proto", "tcp"])
+    if not ok:
+        die("ufw не добавил правило: установлен ли он?")
+    return {"ip": ip, "port": port, "added": added}
+
+
 def cmd_exit(a):
     as_json = "--json" in a
     a = [x for x in a if x != "--json"]
+    if len(a) == 2 and a[0] == "allow":
+        rep = exit_allow(a[1])
+        if as_json:
+            print(json.dumps(rep, ensure_ascii=False, indent=2))
+        else:
+            print(f'Мост {rep["ip"]} пущен на порт {rep["port"]}' + ("." if rep["added"] else " (правило уже было)."))
+        return
     if a not in (["open"], ["close"]):
-        die("используйте: exitctl exit open|close [--json]")
+        die("используйте: exitctl exit open|close|allow <IP> [--json]")
     with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
         rep = exit_open() if a == ["open"] else exit_close()
     if as_json:

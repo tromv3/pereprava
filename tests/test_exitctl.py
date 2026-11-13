@@ -19,7 +19,7 @@ open(os.path.join(tmp, "00_base.json"), "w").write(json.dumps(base))
 stats = {"stat": [{"name": "user>>>default>>>traffic>>>uplink", "value": 100},
                   {"name": "user>>>default>>>traffic>>>downlink", "value": 2500}]}
 mode = {"test_rc": 0, "api": True, "x25519": "PrivateKey: PRIV\nPassword (PublicKey): PUBKEY123\nHash32: zzz\n"}
-api_calls, restarts = [], []
+api_calls, restarts, ufw_calls = [], [], []
 real_run = subprocess.run
 def fake_run(cmd, **k):
     cmd = list(cmd)
@@ -43,12 +43,23 @@ def fake_run(cmd, **k):
         else: r.returncode = 1
     elif cmd[1:2] == ["version"]:
         r.stdout = "Xray 26.1.1 (Xray, Penetrates Everything.)\nmore"
+    elif cmd[0] == "systemctl" and cmd[1:2] == ["is-active"] and mode.get("xray_down"):
+        r.stdout, r.returncode = "inactive", 3
     elif cmd[0] == "systemctl":
         r.stdout = "active"
     elif cmd[:2] == ["ufw", "status"]:
         r.stdout = mode.get("ufw", "")
+    elif cmd[0] == "ufw":
+        ufw_calls.append(cmd[1:])
+        r.stdout = mode.get("ufw_out", "Rule added")
+    elif cmd[0] == "ss":
+        r.stdout = mode.get("ss_tcp" if "-ltnpH" in cmd else "ss_udp", "")
     return r
 ex.subprocess.run = fake_run
+# Установка «наша»: файл состояния установщиков есть, ссылок от прошлых версий нет.
+ex.STATE = os.path.join(tmp, "pereprava.state")
+open(ex.STATE, "w").write("role=test\n")
+ex.INFO_FILES = [os.path.join(tmp, "no-" + n) for n in ("bridge-info.txt", "exit-info.txt", "simple-info.txt")]
 ex.detect_server_ip = lambda: "203.0.113.9"
 
 def cli(*a):
@@ -674,6 +685,64 @@ open(os.path.join(ex.CLOSED_DIR, "00_base.json"), "w").write(json.dumps(closed))
 c, o, e = cli("exit", "open", "--json")
 r = json.loads(o) if c == 0 else {}
 expect("exit open: чужой закрытый конфиг не возвращается", c == 0 and r.get("restored") is False and r.get("users") == ["bridge"], (o, e))
+
+# --- свои правила ufw, exit allow, занятые порты и чужой Xray
+del ufw_calls[:]
+state_before = open(ex.STATE).read()
+c, o, e = cli("exit", "allow", "198.51.100.7", "--json")
+r = json.loads(o) if c == 0 else {}
+expect("exit allow: правило для моста на порт выхода", c == 0 and r == {"ip": "198.51.100.7", "port": 443, "added": True}
+       and ufw_calls == [["allow", "from", "198.51.100.7", "to", "any", "port", "443", "proto", "tcp"]], (o, e, ufw_calls))
+expect("exit allow: правило записано как наше", "ufw=from 198.51.100.7 to any port 443 proto tcp" in open(ex.STATE).read())
+expect("exit allow: не IPv4 — отказ", cli("exit", "allow", "2001:db8::1")[0] == 1 and cli("exit", "allow", "abc")[0] == 1)
+mode["ufw_out"] = "Skipping adding existing rule"
+c, o, e = cli("exit", "allow", "198.51.100.8", "--json")
+expect("exit allow: правило уже было — не наше", c == 0 and json.loads(o)["added"] is False
+       and "198.51.100.8" not in open(ex.STATE).read(), (o, e))
+del mode["ufw_out"]
+
+# Закрытие убирает «443 для всех», только если его добавила установка.
+open(ex.STATE, "w").write("role=exit\n")
+del ufw_calls[:]
+c, o, e = cli("exit", "close")
+expect("exit close: чужое правило 443 не трогается", c == 0 and not any(x[:2] == ["--force", "delete"] for x in ufw_calls), ufw_calls)
+del ufw_calls[:]
+c, o, e = cli("exit", "open")
+expect("exit open: правило 443 добавлено и записано", c == 0 and ["allow", "443/tcp"] in ufw_calls and "ufw=443/tcp" in open(ex.STATE).read(), (ufw_calls, e))
+del ufw_calls[:]
+c, o, e = cli("exit", "close")
+expect("exit close: своё правило убрано и вычеркнуто", c == 0 and ["--force", "delete", "allow", "443/tcp"] in ufw_calls
+       and "ufw=443/tcp" not in open(ex.STATE).read(), ufw_calls)
+
+# Занятые порты и состояние ufw в status.
+mode["ss_tcp"] = ("LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:((\"nginx\",pid=10,fd=6))\n"
+                  "LISTEN 0 128 127.0.0.1:5432 0.0.0.0:* users:((\"postgres\",pid=11,fd=5))\n"
+                  "LISTEN 0 511 [::]:443 [::]:* users:((\"nginx\",pid=10,fd=7))\n"
+                  "LISTEN 0 128 [::]:22 [::]:* users:((\"sshd\",pid=1,fd=4))\n")
+mode["ss_udp"] = "UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:* users:((\"systemd-resolve\",pid=5,fd=13))\n"
+mode["ufw"] = "Status: inactive\n"
+st = json.loads(cli("status", "--json")[1])
+expect("status: занятые порты, локальные помечены", st["listening"] == [
+    {"port": 22, "proto": "tcp", "process": "sshd", "local": False},
+    {"port": 443, "proto": "tcp", "process": "nginx", "local": False},
+    {"port": 5432, "proto": "tcp", "process": "postgres", "local": True},
+    {"port": 53, "proto": "udp", "process": "systemd-resolve", "local": True}], st["listening"])
+expect("status: ufw выключен", st["ufw"] == "inactive", st["ufw"])
+mode.pop("ss_tcp"); mode.pop("ss_udp")
+
+# Чужой Xray: config.json с настройками, а установки нашей нет.
+os.remove(ex.STATE)
+st = json.loads(cli("status", "--json")[1])
+expect("status: чужой Xray не выдаётся за выход", st["foreign_xray"] is True and st["installed"] is False and st["mode"] is None, st)
+for n in os.listdir(tmp):  # в conf.d установки нет ни одного конфига
+    if n.endswith(".json") and os.path.join(tmp, n) != ex.EXIT_CONF:
+        os.remove(os.path.join(tmp, n))
+open(ex.EXIT_CONF, "w").write("{}\n")
+mode["xray_down"] = True
+expect("status: пустой config.json — не чужой", json.loads(cli("status", "--json")[1])["foreign_xray"] is False)
+mode["xray_down"] = False
+expect("status: работающая служба xray без нашей установки — чужая", json.loads(cli("status", "--json")[1])["foreign_xray"] is True)
+open(ex.STATE, "w").write(state_before)
 
 shutil.rmtree(tmp, ignore_errors=True)
 print("Всего:", len(res), "ошибок:", res.count(False))

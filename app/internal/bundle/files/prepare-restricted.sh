@@ -43,6 +43,8 @@ for f in xray geoip.dat geosite.dat; do
 done
 
 install -m 755 "$DIST/xray" /usr/local/bin/xray
+# Xray ставим мы: uninstall.sh потом удалит его (установщики читают это из файла состояния).
+install -d /usr/local/etc/xray && { grep -q "^xray_preexisting=" /usr/local/etc/xray/pereprava.state 2>/dev/null || echo "xray_preexisting=0" >> /usr/local/etc/xray/pereprava.state; } && chmod 600 /usr/local/etc/xray/pereprava.state
 install -d /usr/local/share/xray /usr/local/etc/xray
 install -m 644 "$DIST/geoip.dat" "$DIST/geosite.dat" /usr/local/share/xray/
 

@@ -680,19 +680,12 @@ func (a *App) AllowBridgeOnExit(exitID, bridgeID string) error {
 	if ip == nil || ip.To4() == nil {
 		return errors.New("у моста в настройках указан не IPv4-адрес: разрешите его на выходе вручную")
 	}
-	c, err := a.connect(exitID)
-	if err != nil {
+	// exitctl берёт порт из конфига выхода и записывает правило как своё: снятие настройки его уберёт.
+	if err := a.ensurePython(exitID); err != nil {
 		return err
 	}
-	cmd := "ufw allow from " + ip.String() + " to any port 443 proto tcp"
-	r, err := c.client.Run(a.ctx, cmd, true, nil)
-	if err != nil {
-		return err
-	}
-	if r.Code != 0 {
-		return commandError(r)
-	}
-	return nil
+	_, err = a.tool(exitID, true, "exit", "allow", ip.String(), "--json")
+	return err
 }
 
 // ListDirect возвращает свои домены, которые мост открывает напрямую.
@@ -787,8 +780,11 @@ func (a *App) CheckSNI(id, domain string) (any, error) {
 }
 
 // setupCommand собирает команду установки для роли.
-func setupCommand(dir, mode, sni, bridgeIP, country string, sshPort int) (string, error) {
-	env := "DEBIAN_FRONTEND=noninteractive SSH_PORT=" + strconv.Itoa(sshPort) + " bash "
+func setupCommand(dir, mode, sni, bridgeIP, country string, sshPort, port int) (string, error) {
+	if err := checkPort(port, sshPort); err != nil {
+		return "", err
+	}
+	env := "DEBIAN_FRONTEND=noninteractive SSH_PORT=" + strconv.Itoa(sshPort) + " PORT=" + strconv.Itoa(port) + " bash "
 	switch mode {
 	case "simple":
 		return env + remote.Quote(dir+"/simple-setup.sh") + " " + remote.Quote(sni), nil
@@ -808,6 +804,33 @@ func setupCommand(dir, mode, sni, bridgeIP, country string, sshPort int) (string
 		return env + remote.Quote(dir+"/exit-setup.sh") + " " + remote.Quote(ip.String()) + " " + remote.Quote(sni), nil
 	}
 	return "", fmt.Errorf("неизвестный режим %q", mode)
+}
+
+// checkPort проверяет порт для клиентов: не SSH и не API Xray.
+func checkPort(port, sshPort int) error {
+	switch {
+	case port < 1 || port > 65535:
+		return errors.New("порт — число от 1 до 65535")
+	case port == sshPort:
+		return errors.New("этот порт занят SSH: выберите другой")
+	case port == 10085:
+		return errors.New("порт 10085 нужен API Xray: выберите другой")
+	}
+	return nil
+}
+
+// portBusy возвращает программу, которая уже слушает порт (по разделу listening из exitctl status).
+func portBusy(status any, port int) (string, bool) {
+	st, _ := status.(map[string]any)
+	list, _ := st["listening"].([]any)
+	for _, x := range list {
+		l, _ := x.(map[string]any)
+		if p, _ := l["port"].(float64); int(p) == port && l["proto"] == "tcp" {
+			name, _ := l["process"].(string)
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // modeAllowed проверяет режим по разделу capabilities из exitctl status.
@@ -863,7 +886,8 @@ func (a *App) prepareRestricted(c *conn) error {
 
 // Install настраивает сервер в выбранной роли, вывод идёт событиями log.
 // country — код страны моста (ru, kz...): её сайты мост открывает сам; для других ролей не нужен.
-func (a *App) Install(id, mode, sni, bridgeIP, country string) error {
+// port — порт для клиентов (для выхода — для моста), обычно 443.
+func (a *App) Install(id, mode, sni, bridgeIP, country string, port int) error {
 	sni = strings.TrimSpace(sni)
 	if !reDomain.MatchString(sni) || strings.ContainsAny(sni, ":/") {
 		return errors.New("это не похоже на домен")
@@ -876,7 +900,7 @@ func (a *App) Install(id, mode, sni, bridgeIP, country string) error {
 	if err != nil {
 		return err
 	}
-	cmd, err := setupCommand(c.dir, mode, sni, bridgeIP, country, srv.Port)
+	cmd, err := setupCommand(c.dir, mode, sni, bridgeIP, country, srv.Port, port)
 	if err != nil {
 		return err
 	}
@@ -886,6 +910,15 @@ func (a *App) Install(id, mode, sni, bridgeIP, country string) error {
 	}
 	if err := modeAllowed(st, mode); err != nil {
 		return err
+	}
+	if m, _ := st.(map[string]any); m["foreign_xray"] == true {
+		return errors.New("на сервере уже работает Xray с чужими настройками: установка его бы перенастроила. Используйте другой сервер")
+	}
+	if name, busy := portBusy(st, port); busy {
+		if name == "" {
+			name = "другая программа"
+		}
+		return fmt.Errorf("порт %d уже занят (%s): выберите другой порт, программу на сервере установка не трогает", port, name)
 	}
 	if err := a.prepareRestricted(c); err != nil {
 		return err

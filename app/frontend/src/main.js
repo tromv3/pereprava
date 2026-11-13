@@ -583,7 +583,7 @@ function migrateHelp(st) {
       : 'Переносятся пользователи с их ключами (UUID). Счётчики трафика не переносятся.',
     'Адрес сервера и SNI в ссылках меняются всегда: у нового сервера они свои.',
     'С ключами Reality (галочка ниже) pbk и sid остаются прежними: пользователю достаточно поменять в клиенте адрес и SNI или импортировать новую ссылку. Без них нужна новая ссылка. Галочку ставьте, если на новом сервере ещё никому не выдавали ссылок: выданные там ссылки перестанут работать.',
-    bridge && 'Выход пускает к себе только адрес старого моста. После переноса откройте «Выходы» на новом мосту: у недоступного выхода из списка серверов будет кнопка «Разрешить этот мост на выходе». Выход не из списка придётся открыть вручную на нём самом: ufw allow from АДРЕС_МОСТА to any port 443.',
+    bridge && 'Выход пускает к себе только адрес старого моста. После переноса откройте «Выходы» на новом мосту: у недоступного выхода из списка серверов будет кнопка «Разрешить этот мост на выходе». Выход не из списка придётся открыть вручную на нём самом: ufw allow from АДРЕС_МОСТА to any port ПОРТ_ВЫХОДА proto tcp.',
     'Этот сервер не меняется и продолжает работать, поэтому пользователи могут переходить постепенно. Когда все перешли, снимите с него настройку в «Обслуживании».',
   ]);
 }
@@ -784,7 +784,7 @@ function exitInfoPanel(server, st) {
     const closeBtn = h('button', {}, 'Закрыть выход для клиентов…');
     closeBtn.addEventListener('click', async () => {
       const ok = await confirmDialog('Закрыть выход для клиентов?',
-        'Порт 443 снова будет открыт только для моста, а мост продолжит работать через этот выход как раньше. '
+        `Порт ${st.port || 443} снова будет открыт только для моста, а мост продолжит работать через этот выход как раньше. `
         + 'Остальные пользователи перестанут подключаться, но их ссылки, сроки и накопленный трафик сохранятся на сервере: '
         + 'если открыть выход снова, они вернутся с прежними ссылками. Xray один раз перезапустится.',
         'Закрыть');
@@ -800,14 +800,14 @@ function exitInfoPanel(server, st) {
   openBtn.addEventListener('click', async () => {
     const ok = await confirmDialog('Открыть выход для клиентов?',
       'Клиенты смогут подключаться к этому серверу напрямую, без моста, а мост продолжит работать через него как раньше: его ссылка не изменится. '
-      + 'Порт 443 откроется для всех, а на сервере появятся пользователи, сроки, лимиты и счётчики трафика, как в простом режиме; мост станет пользователем «bridge». '
+      + `Порт ${st.port || 443} откроется для всех, а на сервере появятся пользователи, сроки, лимиты и счётчики трафика, как в простом режиме; мост станет пользователем «bridge». `
       + 'Если выход уже открывали и закрывали, вернутся прежние пользователи с прежними ссылками. '
       + 'Учтите: чем больше клиентов знают адрес выхода, тем выше шанс, что его заметят и заблокируют, и тогда мост тоже потеряет этот выход. Xray один раз перезапустится.',
       'Открыть');
     if (ok) act(openBtn, () => OpenExit(server.id));
   });
   return h('div', { class: 'panel' }, h('h3', {}, 'Выход: ссылка для моста'), errorBox,
-    h('p', { class: 'hint', style: 'margin-bottom:8px' }, 'Порт 443 этого сервера открыт только для адреса моста, указанного при установке.'), box,
+    h('p', { class: 'hint', style: 'margin-bottom:8px' }, `Порт ${st.port || 443} этого сервера открыт только для адреса моста, указанного при установке.`), box,
     h('div', { style: 'margin-top:12px' }, openBtn,
       h('p', { class: 'hint' }, 'Чтобы клиенты подключались и сюда напрямую, без моста. Ссылка моста при этом не меняется.')), log);
 }
@@ -928,7 +928,7 @@ function countryInput(value = 'ru') {
 const MODE_HINTS = {
   simple: 'Один сервер: клиенты подключаются к нему напрямую, и он сам выходит в интернет.',
   bridge: 'Клиенты подключаются сюда. Сайты страны моста открываются напрямую, остальное идёт через выходы, которые вы добавите после установки.',
-  exit: 'Сервер за рубежом, через который мост выпускает трафик. Порт 443 будет открыт только для адреса моста.',
+  exit: 'Сервер за рубежом, через который мост выпускает трафик. Порт для подключений будет открыт только для адреса моста.',
 };
 
 function installPanel(server, st) {
@@ -938,8 +938,39 @@ function installPanel(server, st) {
     return h('div', { class: 'panel' }, h('h3', {}, 'Настройка'),
       h('div', { class: 'error' }, 'С этого сервера нет связи ни с зарубежными адресами, ни с ya.ru, поэтому настроить его нельзя. Проверьте сеть сервера и нажмите «Обновить».'));
   }
+  if (st.foreign_xray) {
+    return h('div', { class: 'panel' }, h('h3', {}, 'Настройка'),
+      h('div', { class: 'error' }, 'На этом сервере уже работает Xray с чужими настройками (/usr/local/etc/xray, служба xray). '
+        + 'Установка его бы перенастроила, поэтому приложение её не предлагает. Используйте другой сервер или снимите тот Xray сами.'));
+  }
   let mode = allowed[0];
   const modeHint = h('p', { class: 'hint' }, MODE_HINTS[mode]);
+
+  // Порт для клиентов (у выхода — для моста). Если 443 занят, предлагаем свободный.
+  const tcpBusy = new Map((st.listening || []).filter((l) => l.proto === 'tcp').map((l) => [l.port, l.process || 'другая программа']));
+  const freePort = [443, 8443, 2053, 2083, 2087, 2096, 9443].find((p) => !tcpBusy.has(p) && p !== server.port) || 8443;
+  const portInput = h('input', { type: 'number', min: 1, max: 65535, value: freePort, style: 'width:110px' });
+  const portNote = h('p', { class: 'hint' });
+  const showPort = () => {
+    const p = Number(portInput.value);
+    const parts = [];
+    if (tcpBusy.has(443) && p !== 443) parts.push(`Порт 443 занят (${tcpBusy.get(443)}), поэтому предложен ${freePort}: программу на сервере установка не трогает.`);
+    if (tcpBusy.has(p)) parts.push(`Порт ${p} занят (${tcpBusy.get(p)}): выберите другой.`);
+    if (p !== 443) parts.push('Порт попадёт в ссылки. 443 выглядит естественнее всего, другие порты заметнее, но тоже работают.');
+    portNote.textContent = parts.join(' ');
+    portNote.className = tcpBusy.has(p) ? 'error' : 'hint';
+  };
+  portInput.addEventListener('input', showPort);
+  showPort();
+  const firewallNote = st.ufw === 'active' ? null : h('p', { class: 'hint' },
+    `Файрвол ufw ${st.ufw === 'inactive' ? 'выключен' : 'не установлен'}: установка включит его, но сначала разрешит порты, которые уже слушают программы на сервере`
+    + ((st.listening || []).some((l) => !l.local) ? ` (${[...new Set((st.listening || []).filter((l) => !l.local).map((l) => `${l.port}/${l.proto}`))].join(', ')})` : '')
+    + '. Снятие настройки выключит его обратно.');
+  const portBox = h('div', { style: 'margin-top:10px' },
+    h('label', { class: 'field', style: 'margin-bottom:4px' },
+      h('span', {}, 'Порт для подключений'), portInput),
+    portNote, firewallNote);
+
   const bridgeIp = h('input', { placeholder: 'например 185.0.0.1' });
   const reachBox = h('div');
   const bridgePick = h('select', { style: 'width:auto' }, h('option', { value: '' }, 'Мост из списка...'),
@@ -1069,9 +1100,17 @@ function installPanel(server, st) {
       showError('Укажите IP-адрес моста.');
       return;
     }
-    const ports = mode === 'exit' ? `порт 443 только для моста ${bridgeIp.value.trim()}` : 'порт 443';
+    const port = Number(portInput.value);
+    if (!(port >= 1 && port <= 65535) || tcpBusy.has(port)) {
+      showError(`Порт ${portInput.value} не подходит: ${tcpBusy.has(port) ? 'он занят' : 'нужно число от 1 до 65535'}.`);
+      return;
+    }
+    const ports = mode === 'exit' ? `порт ${port} только для моста ${bridgeIp.value.trim()}` : `порт ${port}`;
+    const fw = st.ufw === 'active'
+      ? `В файрвол ufw добавятся правила: порт SSH ${server.port} и ${ports}; остальные правила не меняются.`
+      : `Будет включён файрвол ufw: открыты останутся порт SSH ${server.port}, ${ports} и порты, которые уже слушают программы на сервере.`;
     const ok = await confirmDialog(`Настроить как: ${MODE_NAMES[mode]}?`,
-      `На сервер будут установлены Xray и пакеты, включён файрвол ufw (останутся открыты порт SSH ${server.port} и ${ports}). SNI: ${chosen}`,
+      `На сервер будут установлены Xray и пакеты. ${fw} Программы и настройки, которые уже есть на сервере, установка не трогает. SNI: ${chosen}`,
       'Установить');
     if (!ok) return;
     errorBox.replaceChildren();
@@ -1079,7 +1118,7 @@ function installPanel(server, st) {
     installBtn.disabled = true;
     scanBtn.disabled = true;
     try {
-      await Install(server.id, mode, chosen, bridgeIp.value, countryField.value);
+      await Install(server.id, mode, chosen, bridgeIp.value, countryField.value, Number(portInput.value));
       openServer(server.id);
     } catch (e) {
       showError(e);
@@ -1090,7 +1129,7 @@ function installPanel(server, st) {
   });
 
   return h('div', { class: 'panel' }, h('h3', {}, 'Настройка'),
-    h('div', { style: 'margin-bottom:6px' }, modeRadios), modeHint, bridgeBox, countryBox,
+    h('div', { style: 'margin-bottom:6px' }, modeRadios), modeHint, bridgeBox, countryBox, portBox,
     h('p', { class: 'hint', style: 'margin-top:10px' }, 'SNI — домен, под который маскируется соединение; лучше брать сайт из той же подсети, что и сервер.'),
     errorBox,
     h('div', { class: 'row', style: 'margin:12px 0' }, scanBtn),
