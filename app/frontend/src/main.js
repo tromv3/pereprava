@@ -182,8 +182,8 @@ async function offerBridgeUpdate(exitServer, domain) {
   const pick = await bridgeUpdateDialog(others, domain);
   if (!pick) return;
   try {
-    const rep = await UpdateExitSNI(pick.bridgeID, pick.name, domain);
-    await confirmDialog('Готово', `Выход «${rep.name}» на мосту обновлён: serverName ${rep.old || '—'} → ${rep.new}. Мост переподключится к выходу сам.`, 'Понятно');
+    await UpdateExitSNI(pick.bridgeID, pick.name, domain);
+    await confirmDialog('Готово', `Выход «${pick.name}» на мосту обновлён: serverName теперь ${domain}. Мост переподключится к выходу сам.`, 'Понятно');
   } catch (e) {
     await confirmDialog('Не удалось обновить мост', `${msg(e)}\n\nОбновите вручную в консоли моста: exitctl exit sni ${pick.name} ${domain}`, 'Понятно');
   }
