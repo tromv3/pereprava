@@ -1,0 +1,42 @@
+name: Сборка Windows
+
+# Собирает приложение в app/build/bin/pereprava.exe и прикрепляет к запуску как артефакт.
+# Запуск: push в любую ветку или кнопка «Run workflow».
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Приложение (pereprava.exe, Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+      - name: Интерфейс
+        run: npm ci && npm run build
+        working-directory: app/frontend
+      - name: Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.17.1
+      - name: Сборка
+        run: wails build -clean
+      - name: Прикрепить pereprava.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: pereprava-exe-${{ github.sha }}
+          path: app/build/bin/pereprava.exe
+          if-no-files-found: error
+          retention-days: 30

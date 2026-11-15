@@ -13,10 +13,15 @@
   exitctl direct builtin [add|remove <запись>] [--json]
                                    встроенные списки «напрямую»: geosite:, domain:, geoip:, IP/сеть
   exitctl direct country <код>     встроенные списки для страны моста (ru, by, kz...)
+  exitctl sni set <домен> [--ip IP] [--tries N] [--no-check] [--keep-old] [--json]
+                                   сменить SNI на мосту, простом сервере или выходе (проверяется перед применением);
+                                   --keep-old оставляет прежний SNI рабочим (плавная смена)
   exitctl sni check <домен> [--ip IP] [--tries N] [--json]
                                    проверить домен для SNI (код выхода 1 — не подходит)
   exitctl sni scan [--ip IP] [--role bridge|exit] [--top N] [--workers N] [--max-checks N] [--json]
                                    подобрать SNI в /24 сервера (код выхода 1 — ничего не найдено)
+  exitctl exit sni <имя выхода> <домен> [--json]
+                                   сменить serverName (SNI) у выхода на мосту — после смены SNI на выходе
   exitctl user list [--host АДРЕС] [--json]        пользователи, трафик и ссылки
   exitctl user add <имя> [--host АДРЕС] [--json]   добавить пользователя
   exitctl user link <имя> [--host АДРЕС]           показать ссылку пользователя
@@ -148,17 +153,26 @@ def sync_fallback(base, ex):
         b.pop("fallbackTag", None)
 
 
-def write_and_test(base, ex):
-    """Сохранить и проверить конфиг; при ошибке откатить."""
+def write_and_test(base, ex, conf_path=None):
+    """Сохранить и проверить конфиг; при ошибке откатить.
+
+    conf_path — проверить одиночный конфиг через -config вместо -confdir (выход);
+    тогда 20_exits.json не трогается.
+    """
     backups = {}
-    for p in (BASE, EXITS):
+    targets = (BASE, EXITS) if conf_path is None else (conf_path,)
+    for p in targets:
         if os.path.exists(p):
             shutil.copy2(p, p + ".bak")
             backups[p] = p + ".bak"
-    save(BASE, base)
-    save(EXITS, ex)
-    test = subprocess.run([XRAY, "run", "-test", "-confdir", CONF_DIR],
-                          capture_output=True, text=True)
+    if conf_path is None:
+        save(BASE, base)
+        save(EXITS, ex)
+        args = [XRAY, "run", "-test", "-confdir", CONF_DIR]
+    else:
+        save(conf_path, base)
+        args = [XRAY, "run", "-test", "-config", conf_path]
+    test = subprocess.run(args, capture_output=True, text=True)
     if test.returncode != 0:
         for p, b in backups.items():
             shutil.copy2(b, p)
@@ -185,9 +199,9 @@ def restart_xray():
     print("Xray перезапущен.")
 
 
-def apply(base, ex):
+def apply(base, ex, conf_path=None):
     """Сохранить, проверить конфиг, перезапустить; при ошибке проверки откатить."""
-    write_and_test(base, ex)
+    write_and_test(base, ex, conf_path)
     restart_xray()
 
 
@@ -1092,13 +1106,125 @@ def cmd_sni_scan(opts):
         sys.exit(1)
 
 
+def sni_set(raw_domain, server_ip=None, tries=3, no_check=False, keep_old=False, as_json=False):
+    """Сменить домен Reality на мосту, простом сервере или выходе.
+
+    Домен проверяется так же, как в sni check. UUID и ключи Reality не меняются:
+    в ссылках пользователей отличается только sni, их нужно выдать заново.
+
+    keep_old — плавная смена: прежний SNI остаётся в serverNames, и старые ссылки
+    продолжают работать. Прежний можно убрать потом: sni set на тот же домен без --keep-old.
+
+    На выходе, открытом для клиентов (exit open), смена не поддерживается:
+    закройте выход для клиентов (exitctl exit close) и смените SNI.
+    """
+    domain = normalize_domain(raw_domain)
+    if not domain:
+        die(f"{raw_domain!r} — не доменное имя")
+    has_exit, has_base = os.path.exists(EXIT_CONF), os.path.exists(BASE)
+    if has_exit and has_base:
+        die("это выход, открытый для клиентов (exit open): сначала закройте его для клиентов "
+            "(exitctl exit close), затем смените SNI")
+    if has_exit:
+        path = EXIT_CONF
+    elif has_base:
+        path = BASE
+    else:
+        die(f"не найдены {BASE} и {EXIT_CONF}: на этом сервере ничего не установлено")
+
+    conf = load(path)
+    ex = None if has_exit else load(EXITS, {"outbounds": []})
+    try:
+        if has_exit:
+            rs = conf["inbounds"][0]["streamSettings"]["realitySettings"]
+        else:
+            rs = inbound_in(conf)["streamSettings"]["realitySettings"]
+    except (KeyError, IndexError, TypeError):
+        die("в конфиге нет realitySettings: на этом сервере SNI не меняется")
+    old = rs["serverNames"][0]
+
+    names = list(rs.get("serverNames", []))
+    new_names = list(dict.fromkeys(names + [domain])) if keep_old else [domain]
+    dest = f"{domain}:443"
+    if rs.get("serverNames") == new_names and rs.get("dest") == dest:
+        rep = {"old": old, "new": domain, "changed": False, "check": None,
+               "keep_old": keep_old, "serverNames": new_names,
+               "mode": "exit" if has_exit else "bridge"}
+        if as_json:
+            print(json.dumps(rep, ensure_ascii=False, indent=2))
+        else:
+            print(f"SNI уже {domain}, ничего не менялось.")
+        return
+
+    check = None
+    if not no_check:
+        check = sni_check(domain, server_ip or detect_server_ip(), tries)
+        if check["verdict"] == "fail":
+            lines = [f'  [{c["id"]}] {c["message"]}' for c in check["checks"] if c["status"] == "fail"]
+            die("домен не подходит для SNI, ничего не менялось:\n" + "\n".join(lines))
+
+    rs["dest"] = dest
+    rs["serverNames"] = new_names
+    # apply печатает «Конфиг OK» / «Xray перезапущен» — в --json это уходит в stderr.
+    with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
+        apply(conf, ex, EXIT_CONF if has_exit else None)
+    rep = {"old": old, "new": domain, "changed": True,
+           "check": check["verdict"] if check else None,
+           "keep_old": keep_old, "serverNames": rs["serverNames"],
+           "mode": "exit" if has_exit else "bridge"}
+    if as_json:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    else:
+        print(f"SNI изменён: {old} → {domain}. Xray перезапущен.")
+        if keep_old and len(rs["serverNames"]) > 1:
+            print("Прежний SNI «" + ", ".join(n for n in rs["serverNames"] if n != domain)
+                  + "» оставлен рабочим: старые ссылки продолжат работать.")
+            print("Убрать прежний потом: exitctl sni set " + domain + " (без --keep-old).")
+        else:
+            print("UUID и ключи Reality прежние; sni в ссылках стал другим.")
+            print("Выдайте пользователям новые ссылки: exitctl user link <имя>")
+        if has_exit:
+            print("Обновите мосты, которые ходят на этот выход: exitctl exit sni <имя выхода> " + domain)
+
+
+def cmd_sni_set(opts):
+    as_json, ip, tries, no_check, keep_old, positional = False, None, 3, False, False, []
+    while opts:
+        o = opts.pop(0)
+        if o == "--json":
+            as_json = True
+        elif o == "--keep-old":
+            keep_old = True
+        elif o == "--ip" and opts:
+            ip = opts.pop(0)
+            valid_public_ipv4(ip)
+        elif o == "--tries" and opts:
+            t = opts.pop(0)
+            if not t.isdigit() or not 1 <= int(t) <= 10:
+                die("--tries: нужно число от 1 до 10")
+            tries = int(t)
+        elif o == "--no-check":
+            no_check = True
+        elif o.startswith("-"):
+            die(f"неизвестный параметр {o}")
+        else:
+            positional.append(o)
+    if len(positional) != 1:
+        die("используйте: exitctl sni set <домен> [--ip IP] [--tries N] [--no-check] [--keep-old] [--json]")
+    sni_set(positional[0], ip, tries, no_check, keep_old, as_json)
+
+
 def cmd_sni(a):
     if a and a[0] == "scan":
         cmd_sni_scan(a[1:])
         return
+    if a and a[0] == "set":
+        cmd_sni_set(a[1:])
+        return
     if len(a) < 2 or a[0] != "check":
         die("используйте: exitctl sni check <домен> [--ip IP] [--tries N] [--json]\n"
-            "       или: exitctl sni scan [--ip IP] [--role bridge|exit] [--json]")
+            "       или: exitctl sni scan [--ip IP] [--role bridge|exit] [--json]\n"
+            "       или: exitctl sni set <домен> [--ip IP] [--tries N] [--no-check] [--json]")
     domain, opts = a[1], a[2:]
     as_json, ip, tries = False, None, 3
     while opts:
@@ -1993,9 +2119,50 @@ def exit_allow(ip):
     return {"ip": ip, "port": port, "added": added}
 
 
+def exit_sni_outbound(name, raw_domain, as_json=False):
+    """Сменить serverName у выхода на мосту (например, после смены SNI на выходе).
+
+    Выход добавляется и обновляется через HandlerService (ado/rmo), править конфиг
+    можно без перезапуска Xray (apply_routing_change); если API не отвечает, будет перезапуск.
+    """
+    domain = normalize_domain(raw_domain)
+    if not domain:
+        die(f"{raw_domain!r} — не доменное имя")
+    base, ex = load(BASE), load(EXITS, {"outbounds": []})
+    nm = clean_name(name)
+    tag = PREFIX + nm
+    o = next((x for x in ex.get("outbounds", []) if x.get("tag") == tag), None)
+    if o is None:
+        die(f"выход «{name}» не найден (смотрите exitctl list)")
+    ss = o.get("streamSettings", {})
+    rs = ss.get("realitySettings") or ss.get("tlsSettings")
+    if not rs:
+        die(f"у выхода «{nm}» нет realitySettings/tlsSettings: SNI не меняется")
+    old_sni = rs.get("serverName", "")
+    if old_sni == domain:
+        rep = {"name": nm, "old": old_sni, "new": domain, "changed": False}
+        if as_json:
+            print(json.dumps(rep, ensure_ascii=False, indent=2))
+        else:
+            print(f"У выхода «{nm}» уже SNI {domain}, ничего не менялось.")
+        return
+    old_ex = json.loads(json.dumps(ex))
+    rs["serverName"] = domain
+    with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
+        apply_routing_change(base, ex, old_ex)
+    rep = {"name": nm, "old": old_sni, "new": domain, "changed": True}
+    if as_json:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    else:
+        print(f"SNI выхода «{nm}»: {old_sni} → {domain}.")
+
+
 def cmd_exit(a):
     as_json = "--json" in a
     a = [x for x in a if x != "--json"]
+    if len(a) == 3 and a[0] == "sni":
+        exit_sni_outbound(a[1], a[2], as_json)
+        return
     if len(a) == 2 and a[0] == "allow":
         rep = exit_allow(a[1])
         if as_json:
@@ -2004,7 +2171,8 @@ def cmd_exit(a):
             print(f'Мост {rep["ip"]} пущен на порт {rep["port"]}' + ("." if rep["added"] else " (правило уже было)."))
         return
     if a not in (["open"], ["close"]):
-        die("используйте: exitctl exit open|close|allow <IP> [--json]")
+        die("используйте: exitctl exit open|close|allow <IP> [--json]\n"
+            "       или: exitctl exit sni <имя выхода> <домен> [--json]")
     with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
         rep = exit_open() if a == ["open"] else exit_close()
     if as_json:
@@ -2204,7 +2372,7 @@ LOCKED = {"add", "remove", "use", "auto", "direct", "user", "migrate", "exit"}
 
 
 def main(a):
-    if a and a[0] in LOCKED:
+    if a and (a[0] in LOCKED or a[:2] == ["sni", "set"]):
         with state_lock():
             return dispatch(a)
     return dispatch(a)

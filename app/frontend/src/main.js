@@ -1,7 +1,7 @@
 import './style.css';
 import {
   AddDirect, AddExit, AddUser, AllowBridgeOnExit, BackupServer, ChooseBackupOpen, ChooseBackupSave, AutoExit, ChangeBuiltin, CheckExits, CheckReach, CheckSNI, DeleteServer, ExitLink, Health, Install, ListBuiltin, ListExits,
-  ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, Status, TrustServer, Uninstall,
+  ListServers, ListUsers, QRCode, RemoveExit, RemoveUser, SaveServer, ScanSNI, SetSNI, Status, TrustServer, Uninstall, UpdateExitSNI,
   CloseExit, InspectBackup, ListDirect, MigrateUsers, OpenExit, RemoveDirect, ResetUserTraffic, RestoreBackup, SetCountry, SetUserEnabled, SetUserLimit,
   LatestXray, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
   ClientConnect, ClientDisconnect, ClientEnableTUN, ClientState,
@@ -49,6 +49,145 @@ function confirmDialog(title, text, okLabel = 'Продолжить', extra = nu
 }
 
 const msg = (e) => String(e && e.message ? e.message : e);
+
+// Диалог смены SNI: автопоиск в подсети сервера или ручной ввод.
+// Возвращает { domain, keepOld } или null (отмена). keepOld — прежний SNI остаётся рабочим.
+function changeSniDialog(server, st) {
+  return modal((close) => {
+    const role = st.mode === 'exit' ? 'exit' : st.mode === 'simple' ? '' : 'bridge';
+    const manual = h('input', { type: 'text', placeholder: 'или укажите вручную: www.example.com',
+      autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', style: 'margin-top:10px' });
+    const scanBtn = h('button', { class: 'primary' }, 'Подобрать автоматически');
+    const scanHint = h('p', { class: 'hint', style: 'margin-top:6px' },
+      'Обходит до 253 соседних адресов в подсети сервера (до нескольких минут) и проверяет их TLS-сертификаты. Скан чужих адресов может вызвать жалобу хостера.');
+    const results = h('div', { style: 'margin-top:8px' });
+    const keepOld = h('input', { type: 'checkbox', checked: true, style: 'width:auto;margin-right:6px' });
+    const err = h('p', { class: 'fail', style: 'min-height:1.2em;margin:6px 0 0' });
+    let scanned = null; // домен, выбранный сканом
+    const renderCandidates = (rep) => {
+      const candidates = rep.candidates || [];
+      if (!candidates.length) {
+        results.replaceChildren(h('div', { class: 'error' },
+          `В подсети ${rep.subnet} подходящих доменов нет (отброшено имён: ${(rep.rejected || []).length}). Укажите свой домен вручную.`));
+        return;
+      }
+      scanned = candidates[0].domain;
+      const items = candidates.map((c, i) => {
+        const radio = h('input', { type: 'radio', name: 'sni-pick', checked: i === 0 });
+        const box = h('label', { class: `candidate${i === 0 ? ' selected' : ''}` }, radio,
+          h('b', {}, c.domain), ` — оценка ${c.score}, ${c.ip}`,
+          h('ul', {}, c.reasons.map((r) => h('li', {}, r))));
+        radio.addEventListener('change', () => {
+          results.querySelectorAll('.candidate').forEach((n) => n.classList.remove('selected'));
+          box.classList.add('selected');
+          scanned = c.domain;
+        });
+        return box;
+      });
+      results.replaceChildren(...items);
+    };
+    scanBtn.addEventListener('click', async () => {
+      const ok = await confirmDialog('Просканировать соседние адреса?',
+        'Приложение обойдёт до 253 соседних адресов в подсети сервера и прочитает их TLS-сертификаты. Это занимает до нескольких минут. Скан чужих адресов может вызвать жалобу хостера.',
+        'Сканировать');
+      if (!ok) return;
+      err.textContent = '';
+      results.replaceChildren(h('p', { class: 'hint' }, 'Сканирую подсеть сервера...'));
+      scanBtn.disabled = true;
+      try {
+        renderCandidates(await ScanSNI(server.id, role));
+      } catch (e) {
+        results.replaceChildren();
+        err.textContent = msg(e);
+      } finally {
+        scanBtn.disabled = false;
+      }
+    });
+    const ok = () => {
+      const d = manual.value.trim().toLowerCase() || scanned;
+      if (!d) { err.textContent = 'Выберите кандидата или укажите домен вручную.'; return; }
+      if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(d)) {
+        err.textContent = 'Укажите доменное имя, например www.example.com.';
+        return;
+      }
+      close({ domain: d, keepOld: keepOld.checked });
+    };
+    manual.addEventListener('keydown', (e) => { if (e.key === 'Enter') ok(); });
+    return [
+      h('h3', {}, 'Сменить SNI'),
+      h('p', {}, `Сейчас: ${st.sni}. Укажите домен, под который будет маскироваться соединение.`),
+      scanBtn, scanHint, results, manual,
+      h('label', { style: 'cursor:pointer;display:block;margin-top:10px' }, keepOld, 'Плавная смена: оставить прежний SNI рабочим'),
+      h('p', { class: 'hint' },
+        'Пока прежний SNI рабочий, старые ссылки продолжают работать; снять его можно потом, вызвав смену на тот же домен с этой галкой снятой. '
+        + 'Домен проверится перед применением (TLS 1.3, h2, сертификат, HTTP): если не подходит, ничего не изменится. '
+        + 'UUID и ключи Reality останутся прежними. Если галку снять — старые ссылки перестанут работать сразу.'),
+      err,
+      h('div', { class: 'modal-actions' },
+        h('button', { onclick: () => close(null) }, 'Отмена'),
+        h('button', { class: 'primary', onclick: ok }, 'Сменить')),
+    ];
+  });
+}
+
+// После смены SNI на выходе мост хранит прежний serverName: предложить обновить его.
+function bridgeUpdateDialog(servers, domain) {
+  return modal((close) => {
+    const sel = h('select', {}, servers.map((s) => h('option', { value: s.id }, `${s.name} (${s.host})`)));
+    const exitSel = h('select', { disabled: true }, h('option', {}, 'загрузка...'));
+    const err = h('p', { class: 'fail', style: 'min-height:1.2em;margin:6px 0 0' });
+    const loadExits = async () => {
+      exitSel.disabled = true;
+      exitSel.replaceChildren(h('option', {}, 'загрузка...'));
+      err.textContent = '';
+      try {
+        const rep = await ListExits(sel.value);
+        const rows = (rep && rep.exits) || [];
+        if (!rows.length) {
+          exitSel.replaceChildren(h('option', { value: '' }, 'на этом сервере нет выходов'));
+          return;
+        }
+        exitSel.replaceChildren(...rows.map((r) => h('option', { value: r.name }, `${r.name} — ${r.address}:${r.port}`)));
+        exitSel.disabled = false;
+      } catch (e) {
+        exitSel.replaceChildren(h('option', { value: '' }, 'не удалось узнать выходы'));
+        err.textContent = msg(e);
+      }
+    };
+    sel.addEventListener('change', loadExits);
+    loadExits();
+    const ok = () => {
+      if (exitSel.disabled || !exitSel.value) {
+        err.textContent = 'Выберите выход на мосту или нажмите «Позже».';
+        return;
+      }
+      close({ bridgeID: sel.value, name: exitSel.value });
+    };
+    return [
+      h('h3', {}, 'Обновить мост'),
+      h('p', {}, `SNI выхода изменён на ${domain}. Выберите мост, который ходит на этот выход, и выход на нём: в нём поменяется только sni (serverName). UUID и ключи Reality останутся прежними.`),
+      h('label', { class: 'field' }, h('span', {}, 'Мост'), sel),
+      h('label', { class: 'field', style: 'margin-top:8px' }, h('span', {}, 'Выход на нём'), exitSel),
+      err,
+      h('div', { class: 'modal-actions' },
+        h('button', { onclick: () => close(null) }, 'Позже'),
+        h('button', { class: 'primary', onclick: ok }, 'Обновить')),
+    ];
+  });
+}
+
+async function offerBridgeUpdate(exitServer, domain) {
+  const others = state.servers.filter((s) => s.id !== exitServer.id);
+  if (!others.length) return;
+  const pick = await bridgeUpdateDialog(others, domain);
+  if (!pick) return;
+  try {
+    const rep = await UpdateExitSNI(pick.bridgeID, pick.name, domain);
+    await confirmDialog('Готово', `Выход «${rep.name}» на мосту обновлён: serverName ${rep.old || '—'} → ${rep.new}. Мост переподключится к выходу сам.`, 'Понятно');
+  } catch (e) {
+    await confirmDialog('Не удалось обновить мост', `${msg(e)}\n\nОбновите вручную в консоли моста: exitctl exit sni ${pick.name} ${domain}`, 'Понятно');
+  }
+}
 
 function passwordDialog(title, text, confirm, extra = null) {
   return modal((close) => {
@@ -473,6 +612,24 @@ function maintenancePanel(server, st) {
   const toolBtn = h('button', {}, 'Обновить exitctl на сервере');
   toolBtn.addEventListener('click', () => run(toolBtn, () => UpdateTool(server.id), () => openServer(server.id)));
 
+  // Смена SNI — на мосту, простом сервере и выходе. На мосту и простом сервере те же условия,
+  // что при установке; на выходе после смены предложим обновить мост.
+  const sniBtn = h('button', {}, 'Сменить SNI…');
+  sniBtn.addEventListener('click', async () => {
+    const picked = await changeSniDialog(server, st);
+    if (!picked) return;
+    run(sniBtn, () => SetSNI(server.id, picked.domain, picked.keepOld), async () => {
+      log.textContent += picked.keepOld
+        ? `SNI изменён: ${st.sni} → ${picked.domain} (прежний оставлен рабочим).\n`
+        : `SNI изменён: ${st.sni} → ${picked.domain}.\n`;
+      if (st.mode !== 'exit' && !picked.keepOld) {
+        log.textContent += 'Выдайте новые ссылки: список пользователей → ссылка/QR.\n';
+      }
+      openServer(server.id);
+      if (st.mode === 'exit') await offerBridgeUpdate(server, picked.domain);
+    });
+  });
+
   // Копия нужна мосту и простому серверу: на выходе нет пользователей.
   const saveBtn = h('button', {}, 'Сохранить копию…');
   saveBtn.addEventListener('click', async () => {
@@ -519,6 +676,7 @@ function maintenancePanel(server, st) {
   if (st.mode !== 'exit') fileButtons.unshift(geoFileBtn);
   buttons.push(...fileButtons);
   if (toolOutdated) buttons.push(toolBtn);
+  buttons.push(sniBtn);
   if (st.mode !== 'exit') buttons.push(saveBtn, restoreBtn);
   buttons.push(uninstallBtn);
 

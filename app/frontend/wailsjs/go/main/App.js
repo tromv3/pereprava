@@ -170,6 +170,14 @@ export function SetCountry(arg1, arg2) {
   return window['go']['main']['App']['SetCountry'](arg1, arg2);
 }
 
+export function SetSNI(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SetSNI'](arg1, arg2, arg3);
+}
+
+export function UpdateExitSNI(arg1, arg2, arg3) {
+  return window['go']['main']['App']['UpdateExitSNI'](arg1, arg2, arg3);
+}
+
 export function SetUserEnabled(arg1, arg2, arg3) {
   return window['go']['main']['App']['SetUserEnabled'](arg1, arg2, arg3);
 }

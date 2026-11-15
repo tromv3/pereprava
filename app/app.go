@@ -779,6 +779,44 @@ func (a *App) CheckSNI(id, domain string) (any, error) {
 	return a.tool(id, false, "sni", "check", domain, "--json")
 }
 
+// SetSNI меняет домен, под который маскируется сервер, на мосту, простом сервере или выходе.
+// Домен проверяется до применения; при ошибке проверки или запуска Xray изменения отменяются.
+// UUID и ключи Reality не меняются, но sni в ссылках станет новым, если не оставлен прежний.
+// keepOld — плавная смена: прежний SNI остаётся рабочим, старые ссылки продолжают работать.
+// На открытом для клиентов выходе смена не выполняется: сначала закройте его для клиентов.
+func (a *App) SetSNI(id, domain string, keepOld bool) (any, error) {
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	if !reDomain.MatchString(domain) || strings.ContainsAny(domain, ":/") {
+		return nil, errors.New("это не похоже на домен")
+	}
+	if err := a.ensurePython(id); err != nil {
+		return nil, err
+	}
+	args := []string{"sni", "set", domain}
+	if keepOld {
+		args = append(args, "--keep-old")
+	}
+	args = append(args, "--json")
+	return a.tool(id, false, args...)
+}
+
+// UpdateExitSNI меняет serverName (sni) у выхода на мосту — например, после смены SNI на выходе.
+// Меняется только sni: UUID, ключи Reality и порты не затрагиваются.
+func (a *App) UpdateExitSNI(bridgeID, exitName, domain string) (any, error) {
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	if !reDomain.MatchString(domain) || strings.ContainsAny(domain, ":/") {
+		return nil, errors.New("это не похоже на домен")
+	}
+	exitName = strings.TrimSpace(exitName)
+	if exitName == "" || !reUser.MatchString(exitName) {
+		return nil, errors.New("в имени выхода допустимы латинские буквы, цифры, пробел, - и _")
+	}
+	if err := a.ensurePython(bridgeID); err != nil {
+		return nil, err
+	}
+	return a.tool(bridgeID, false, "exit", "sni", exitName, domain, "--json")
+}
+
 // setupCommand собирает команду установки для роли.
 func setupCommand(dir, mode, sni, bridgeIP, country string, sshPort, port int) (string, error) {
 	if err := checkPort(port, sshPort); err != nil {
