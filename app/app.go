@@ -779,6 +779,75 @@ func (a *App) CheckSNI(id, domain string) (any, error) {
 	return a.tool(id, false, "sni", "check", domain, "--json")
 }
 
+// SetSNI меняет домен, под который маскируется сервер, на мосту, простом сервере или выходе.
+// Домен проверяется до применения; при ошибке проверки или запуска Xray изменения отменяются.
+// UUID и ключи Reality не меняются, но sni в ссылках станет новым, если не оставлен прежний.
+// keepOld — плавная смена: прежний SNI остаётся рабочим, старые ссылки продолжают работать.
+// На открытом для клиентов выходе смена не выполняется: сначала закройте его для клиентов.
+//
+// Команда выполняется отсоединённо (как обновление Xray): смена перезапускает Xray, и если
+// компьютер ходит на сервер через этот же Xray, SSH-сессия рвётся в момент перезапуска —
+// задание при этом дорабатывает, приложение переподключается и дочитывает журнал и код выхода.
+func (a *App) SetSNI(id, domain string, keepOld bool) (any, error) {
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	if !reDomain.MatchString(domain) || strings.ContainsAny(domain, ":/") {
+		return nil, errors.New("это не похоже на домен")
+	}
+	if err := a.ensurePython(id); err != nil {
+		return nil, err
+	}
+	c, err := a.connect(id)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"sni", "set", domain}
+	if keepOld {
+		args = append(args, "--keep-old")
+	}
+	args = append(args, "--json")
+	quoted := make([]string, len(args))
+	for i, x := range args {
+		quoted[i] = remote.Quote(x)
+	}
+	cmd := "PYTHONUTF8=1 python3 " + remote.Quote(c.dir+"/exitctl") + " " + strings.Join(quoted, " ")
+	if err := a.runDetachedCmd(id, c, cmd, "не удалось сменить SNI"); err != nil {
+		return nil, err
+	}
+	return map[string]any{"changed": true, "domain": domain, "keepOld": keepOld}, nil
+}
+
+// UpdateExitSNI меняет serverName (sni) у выхода на мосту — например, после смены SNI на выходе.
+// Меняется только sni: UUID, ключи Reality и порты не затрагиваются.
+// Отсоединённо: обновление обычно применяется на лету через API, но при его отказе
+// Xray перезапускается, и SSH через этот же сервер оборвался бы.
+func (a *App) UpdateExitSNI(bridgeID, exitName, domain string) (any, error) {
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	if !reDomain.MatchString(domain) || strings.ContainsAny(domain, ":/") {
+		return nil, errors.New("это не похоже на домен")
+	}
+	exitName = strings.TrimSpace(exitName)
+	if exitName == "" || !reUser.MatchString(exitName) {
+		return nil, errors.New("в имени выхода допустимы латинские буквы, цифры, пробел, - и _")
+	}
+	if err := a.ensurePython(bridgeID); err != nil {
+		return nil, err
+	}
+	c, err := a.connect(bridgeID)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"exit", "sni", exitName, domain, "--json"}
+	quoted := make([]string, len(args))
+	for i, x := range args {
+		quoted[i] = remote.Quote(x)
+	}
+	cmd := "PYTHONUTF8=1 python3 " + remote.Quote(c.dir+"/exitctl") + " " + strings.Join(quoted, " ")
+	if err := a.runDetachedCmd(bridgeID, c, cmd, fmt.Sprintf("не удалось обновить serverName у выхода «%s»", exitName)); err != nil {
+		return nil, err
+	}
+	return map[string]any{"changed": true, "name": exitName, "domain": domain}, nil
+}
+
 // setupCommand собирает команду установки для роли.
 func setupCommand(dir, mode, sni, bridgeIP, country string, sshPort, port int) (string, error) {
 	if err := checkPort(port, sshPort); err != nil {

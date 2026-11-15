@@ -744,6 +744,117 @@ mode["xray_down"] = False
 expect("status: работающая служба xray без нашей установки — чужая", json.loads(cli("status", "--json")[1])["foreign_xray"] is True)
 open(ex.STATE, "w").write(state_before)
 
+# --- sni set: смена домена Reality на мосту ---
+base = {"inbounds": [{"tag": "in", "port": 443,
+    "settings": {"clients": [{"id": "aaaaaaaa-0000-0000-0000-000000000000", "flow": "xtls-rprx-vision", "email": "default"}], "decryption": "none"},
+    "streamSettings": {"realitySettings": {"privateKey": "PRIV", "serverNames": ["site.example"], "shortIds": ["ab12"]}}}],
+    "outbounds": [], "routing": {"rules": []}}
+base_path = os.path.join(tmp, "00_base.json")
+open(base_path, "w").write(json.dumps(base))
+saved_exit_conf = ex.EXIT_CONF
+ex.EXIT_CONF = os.path.join(tmp, "no-exit.json")  # выхода нет: мост/простой сервер
+real_sni_check = ex.sni_check
+ex.sni_check = lambda domain, server_ip=None, tries=3: {"verdict": "ok", "domain": domain, "checks": []}
+
+c, o, e = cli("sni", "set", "newsite.example", "--json")
+r = json.loads(o) if c == 0 else {}
+rs = json.load(open(base_path))["inbounds"][0]["streamSettings"]["realitySettings"]
+expect("sni set: конфиг обновлён, ключи Reality те же",
+       c == 0 and rs["serverNames"] == ["newsite.example"] and rs["dest"] == "newsite.example:443"
+       and rs["privateKey"] == "PRIV" and rs["shortIds"] == ["ab12"], (c, o, e))
+expect("sni set: отчёт", r == {"old": "site.example", "new": "newsite.example", "changed": True, "check": "ok",
+                               "keep_old": False, "serverNames": ["newsite.example"], "mode": "bridge"}, r)
+expect("sni set: в ссылке пользователя новый sni",
+       "sni=newsite.example" in json.loads(cli("user", "list", "--json")[1])[0]["link"])
+expect("sni set: тот же домен — ничего не меняется",
+       json.loads(cli("sni", "set", "newsite.example", "--json")[1])["changed"] is False and rs is not None)
+
+saved_base = open(base_path).read()
+ex.sni_check = lambda domain, server_ip=None, tries=3: {"verdict": "fail", "domain": domain,
+                                                        "checks": [{"id": "tls13", "status": "fail", "message": "нет TLS 1.3"}]}
+c, o, e = cli("sni", "set", "bad.example")
+expect("sni set: домен не подходит — отказ и конфиг прежний",
+       c == 1 and "tls13" in e and open(base_path).read() == saved_base, (c, o, e))
+ex.sni_check = lambda domain, server_ip=None, tries=3: {"verdict": "warn", "domain": domain, "checks": []}
+mode["test_rc"] = 1  # xray run -test не принимает конфиг
+c, o, e = cli("sni", "set", "third.example")
+expect("sni set: xray не принял конфиг — откат",
+       c == 1 and open(base_path).read() == saved_base, (c, o, e))
+mode["test_rc"] = 0
+expect("sni set: несуществующий домен отклонён", cli("sni", "set", "не домен")[0] == 1)
+expect("sni set: лишние аргументы отклонены", cli("sni", "set", "a.example", "b.example")[0] == 1)
+
+# Пустой {} рядом с 00_base.json — нормальный мост (скелет установщика Xray), а не «открытый выход».
+open(ex.EXIT_CONF, "w").write("{}\n")
+c, o, e = cli("sni", "set", "ok.example", "--json")
+rs = json.load(open(base_path))["inbounds"][0]["streamSettings"]["realitySettings"]
+expect("sni set: пустой config.json рядом с мостом — это мост",
+       c == 0 and rs["serverNames"] == ["ok.example"] and json.loads(o)["mode"] == "bridge", (o, e))
+
+# Открытый для клиентов выход: реальный config.json + 00_base.json — sni set запрещён.
+open(ex.EXIT_CONF, "w").write(json.dumps({"inbounds": [{"port": 443,
+    "streamSettings": {"realitySettings": {"dest": "o.example:443", "serverNames": ["o.example"],
+                                           "privateKey": "PRIV", "shortIds": ["cd34"]}}}]}))
+c, o, e = cli("sni", "set", "ok2.example")
+expect("sni set: на открытом для клиентов выходе отклонён", c == 1 and "выход" in e, (c, o, e))
+
+# Чистый выход (config.json без 00_base.json): sni set меняет сам выход.
+os.remove(ex.EXIT_CONF)
+os.remove(base_path)
+open(ex.EXIT_CONF, "w").write(json.dumps({"inbounds": [{"port": 443,
+    "streamSettings": {"realitySettings": {"dest": "e.example:443", "serverNames": ["e.example"],
+                                           "privateKey": "PRIV", "shortIds": ["cd34"]}}}]}))
+cli("sni", "set", "f.example", "--json")
+rs = json.load(open(ex.EXIT_CONF))["inbounds"][0]["streamSettings"]["realitySettings"]
+expect("sni set: на выходе меняет config.json, ключи те же",
+       rs["serverNames"] == ["f.example"] and rs["dest"] == "f.example:443" and rs["privateKey"] == "PRIV"
+       and rs["shortIds"] == ["cd34"], rs)
+expect("sni set: на выходе режим exit",
+       json.loads(cli("sni", "set", "f.example", "--json")[1])["mode"] == "exit")
+mode["test_rc"] = 1  # xray не принял конфиг выхода — откат
+before_exit = open(ex.EXIT_CONF).read()
+cli("sni", "set", "g.example")
+expect("sni set: на выходе откат при ошибке проверки", open(ex.EXIT_CONF).read() == before_exit)
+mode["test_rc"] = 0
+os.remove(ex.EXIT_CONF)  # чистого выхода больше нет — дальше мост
+open(base_path, "w").write(json.dumps(base))
+ex.EXIT_CONF = os.path.join(tmp, "no-exit.json")  # не существует: ни выхода, ни открытого выхода
+
+# Плавная смена: --keep-old оставляет прежний SNI рабочим.
+ex.sni_check = lambda domain, server_ip=None, tries=3: {"verdict": "ok", "domain": domain, "checks": []}
+cli("sni", "set", "a.example", "--json")
+c, o, e = cli("sni", "set", "b.example", "--keep-old", "--json")
+rs = json.load(open(base_path))["inbounds"][0]["streamSettings"]["realitySettings"]
+expect("sni set: --keep-old добавляет новый SNI, прежний рабочий",
+       c == 0 and rs["serverNames"] == ["a.example", "b.example"] and rs["dest"] == "b.example:443", (o, e, rs))
+s = json.loads(cli("status", "--json")[1])
+expect("status: после --keep-old текущий SNI — новый, в списке оба",
+       s["sni"] == "b.example" and s["server_names"] == ["a.example", "b.example"], s)
+link = json.loads(cli("user", "list", "--json")[1])[0]["link"]
+expect("ссылка после --keep-old идёт с новым SNI", "sni=b.example" in link, link)
+cli("sni", "set", "c.example", "--json")
+rs = json.load(open(base_path))["inbounds"][0]["streamSettings"]["realitySettings"]
+expect("sni set: без --keep-old прежний отбрасывается", rs["serverNames"] == ["c.example"], rs)
+
+# exit sni на мосту: обновление serverName у выхода (например, после смены SNI на выходе).
+ex_exits = {"outbounds": [{"tag": "exit-nl1", "protocol": "vless",
+    "settings": {"vnext": [{"address": "198.51.100.20", "port": 443,
+                           "users": [{"id": "uuuuuuuu-0000-0000-0000-000000000000", "encryption": "none"}]}]},
+    "streamSettings": {"network": "tcp", "security": "reality",
+                       "realitySettings": {"serverName": "old.example", "publicKey": "PUB", "shortId": "ab12",
+                                           "fingerprint": "chrome"}}}]}
+exits_path = os.path.join(tmp, "20_exits.json")
+open(exits_path, "w").write(json.dumps(ex_exits))
+c, o, e = cli("exit", "sni", "nl1", "new.example", "--json")
+rs = json.load(open(exits_path))["outbounds"][0]["streamSettings"]["realitySettings"]
+expect("exit sni: serverName выхода обновлён",
+       c == 0 and rs["serverName"] == "new.example" and json.loads(o)["changed"] is True, (o, e))
+expect("exit sni: неизвестный выход отклонён", cli("exit", "sni", "nope", "x.example")[0] == 1)
+expect("exit sni: неверный домен отклонён", cli("exit", "sni", "nl1", "не домен")[0] == 1)
+os.remove(exits_path)
+
+ex.sni_check = real_sni_check
+
 shutil.rmtree(tmp, ignore_errors=True)
 print("Всего:", len(res), "ошибок:", res.count(False))
 sys.exit(1 if False in res else 0)

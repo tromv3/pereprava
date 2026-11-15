@@ -87,6 +87,10 @@ export function ScanSNI(arg1:string,arg2:string):Promise<any>;
 
 export function SetCountry(arg1:string,arg2:string):Promise<any>;
 
+export function SetSNI(arg1:string,arg2:string,arg3:boolean):Promise<any>;
+
+export function UpdateExitSNI(arg1:string,arg2:string,arg3:string):Promise<any>;
+
 export function SetUserEnabled(arg1:string,arg2:string,arg3:boolean):Promise<any>;
 
 export function SetUserLimit(arg1:string,arg2:string,arg3:string,arg4:number):Promise<any>;
