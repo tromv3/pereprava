@@ -784,8 +784,18 @@ mode["test_rc"] = 0
 expect("sni set: несуществующий домен отклонён", cli("sni", "set", "не домен")[0] == 1)
 expect("sni set: лишние аргументы отклонены", cli("sni", "set", "a.example", "b.example")[0] == 1)
 
-open(ex.EXIT_CONF, "w").write("{}\n")  # выход, открытый для клиентов: sni set запрещён
-c, o, e = cli("sni", "set", "ok.example")
+# Пустой {} рядом с 00_base.json — нормальный мост (скелет установщика Xray), а не «открытый выход».
+open(ex.EXIT_CONF, "w").write("{}\n")
+c, o, e = cli("sni", "set", "ok.example", "--json")
+rs = json.load(open(base_path))["inbounds"][0]["streamSettings"]["realitySettings"]
+expect("sni set: пустой config.json рядом с мостом — это мост",
+       c == 0 and rs["serverNames"] == ["ok.example"] and json.loads(o)["mode"] == "bridge", (o, e))
+
+# Открытый для клиентов выход: реальный config.json + 00_base.json — sni set запрещён.
+open(ex.EXIT_CONF, "w").write(json.dumps({"inbounds": [{"port": 443,
+    "streamSettings": {"realitySettings": {"dest": "o.example:443", "serverNames": ["o.example"],
+                                           "privateKey": "PRIV", "shortIds": ["cd34"]}}}]}))
+c, o, e = cli("sni", "set", "ok2.example")
 expect("sni set: на открытом для клиентов выходе отклонён", c == 1 and "выход" in e, (c, o, e))
 
 # Чистый выход (config.json без 00_base.json): sni set меняет сам выход.

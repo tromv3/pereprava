@@ -1121,7 +1121,7 @@ def sni_set(raw_domain, server_ip=None, tries=3, no_check=False, keep_old=False,
     domain = normalize_domain(raw_domain)
     if not domain:
         die(f"{raw_domain!r} — не доменное имя")
-    has_exit, has_base = os.path.exists(EXIT_CONF), os.path.exists(BASE)
+    has_exit, has_base = real_exit_conf(), os.path.exists(BASE)
     if has_exit and has_base:
         die("это выход, открытый для клиентов (exit open): сначала закройте его для клиентов "
             "(exitctl exit close), затем смените SNI")
@@ -1707,6 +1707,24 @@ def file_sha256(path):
             return hashlib.sha256(f.read()).hexdigest()
     except OSError:
         return None
+
+
+def real_exit_conf():
+    """config.json похож на наш выход (inbound с realitySettings).
+
+    Установщик Xray при любой установке кладёт в /usr/local/etc/xray/config.json
+    пустой {} (мост им не пользуется — он работает из conf.d), поэтому одного
+    существования файла мало: нужен разобранный inbound с realitySettings.
+    """
+    try:
+        with open(EXIT_CONF) as f:
+            conf = json.load(f)
+        inbounds = conf.get("inbounds") or []
+        if not inbounds or not isinstance(inbounds, list):
+            return False
+        return bool((inbounds[0].get("streamSettings") or {}).get("realitySettings"))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
 
 
 def is_ours():
