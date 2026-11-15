@@ -4,17 +4,27 @@ name: Релиз
 # pereprava-<версия>-windows-amd64.exe, pereprava-<версия>-linux-amd64.tar.gz, SHA256SUMS.txt.
 # Если релиз уже создан вручную (например, с готовыми заметками), ассеты прикрепляются к нему,
 # иначе релиз создаётся автоматически со списком pull request'ов.
+# Вручную: вкладка Actions → Релиз → Run workflow → укажите существующий тег (по умолчанию v0.8.0).
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег релиза, к которому прикрепятся файлы (например, v0.8.0)'
+        required: true
+        default: 'v0.8.0'
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
   cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   windows:
@@ -44,7 +54,7 @@ jobs:
       - name: Имя файла
         working-directory: .
         shell: bash
-        run: cp app/build/bin/pereprava.exe "pereprava-${GITHUB_REF_NAME#v}-windows-amd64.exe"
+        run: cp app/build/bin/pereprava.exe "pereprava-${RELEASE_TAG#v}-windows-amd64.exe"
       - uses: actions/upload-artifact@v5
         with:
           name: release-windows
@@ -79,7 +89,7 @@ jobs:
         run: wails build -clean -tags webkit2_41
       - name: Архив
         working-directory: .
-        run: tar -czf "pereprava-${GITHUB_REF_NAME#v}-linux-amd64.tar.gz" -C app/build/bin pereprava
+        run: tar -czf "pereprava-${RELEASE_TAG#v}-linux-amd64.tar.gz" -C app/build/bin pereprava
       - uses: actions/upload-artifact@v5
         with:
           name: release-linux
@@ -91,6 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [windows, linux]
     steps:
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
           pattern: release-*
@@ -101,10 +112,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ver="${GITHUB_REF_NAME#v}"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --clobber pereprava-*.exe pereprava-*.tar.gz SHA256SUMS.txt
+          set -o pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          if out=$(gh release view "$RELEASE_TAG" 2>&1); then
+            echo "$out"
+            if out=$(gh release upload "$RELEASE_TAG" --clobber pereprava-*.exe pereprava-*.tar.gz SHA256SUMS.txt 2>&1); then
+              echo "$out"
+            else
+              rc=$?; echo "$out"; fail "gh release upload завершился с кодом $rc: $(echo "$out" | tr '\n' ' ')"
+            fi
           else
-            gh release create "$GITHUB_REF_NAME" --title "Переправа $ver" --generate-notes \
-              pereprava-*.exe pereprava-*.tar.gz SHA256SUMS.txt
+            echo "$out"
+            if out=$(gh release create "$RELEASE_TAG" --title "Переправа ${RELEASE_TAG#v}" --generate-notes pereprava-*.exe pereprava-*.tar.gz SHA256SUMS.txt 2>&1); then
+              echo "$out"
+            else
+              rc=$?; echo "$out"; fail "gh release create завершился с кодом $rc: $(echo "$out" | tr '\n' ' ')"
+            fi
           fi
