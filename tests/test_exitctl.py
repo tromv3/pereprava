@@ -827,6 +827,11 @@ c, o, e = cli("sni", "set", "b.example", "--keep-old", "--json")
 rs = json.load(open(base_path))["inbounds"][0]["streamSettings"]["realitySettings"]
 expect("sni set: --keep-old добавляет новый SNI, прежний рабочий",
        c == 0 and rs["serverNames"] == ["a.example", "b.example"] and rs["dest"] == "b.example:443", (o, e, rs))
+s = json.loads(cli("status", "--json")[1])
+expect("status: после --keep-old текущий SNI — новый, в списке оба",
+       s["sni"] == "b.example" and s["server_names"] == ["a.example", "b.example"], s)
+link = json.loads(cli("user", "list", "--json")[1])[0]["link"]
+expect("ссылка после --keep-old идёт с новым SNI", "sni=b.example" in link, link)
 cli("sni", "set", "c.example", "--json")
 rs = json.load(open(base_path))["inbounds"][0]["streamSettings"]["realitySettings"]
 expect("sni set: без --keep-old прежний отбрасывается", rs["serverNames"] == ["c.example"], rs)

@@ -1288,7 +1288,7 @@ def client_link(base, client, host, pub):
     rs = ib["streamSettings"]["realitySettings"]
     flow = client.get("flow", "")
     return (f'vless://{client["id"]}@{host}:{ib["port"]}?type=tcp&security=reality'
-            f'&sni={rs["serverNames"][0]}&pbk={pub}&sid={rs["shortIds"][0]}&fp=chrome'
+            f'&sni={current_sni(rs)}&pbk={pub}&sid={rs["shortIds"][0]}&fp=chrome'
             + (f"&flow={flow}" if flow else "") + f"#{client_name(client)}")
 
 
@@ -1812,6 +1812,19 @@ def ufw_remove(args):
     return True
 
 
+def current_sni(rs):
+    """Актуальный SNI — домен из dest: маскировка идёт именно под него.
+
+    serverNames[0] устаревает после плавной смены (--keep-old): прежний остаётся
+    в списке ради старых ссылок.
+    """
+    dest = (rs.get("dest") or "").strip()
+    if dest:
+        return dest.split(":")[0]
+    names = rs.get("serverNames") or []
+    return names[-1] if names else None
+
+
 def status_report():
     meminfo = dict(re.findall(r"^(\w+):\s+(\d+) kB", read_file("/proc/meminfo") or "", re.M))
     mem_total, mem_avail = meminfo.get("MemTotal"), meminfo.get("MemAvailable")
@@ -1839,14 +1852,16 @@ def status_report():
         },
         "installed": os.path.exists(BASE),
         "tool_sha256": file_sha256(INSTALLED_TOOL),
-        "mode": None, "sni": None, "port": None, "users": None, "exits": None, "bridge_user": False,
+        "mode": None, "sni": None, "server_names": [], "port": None, "users": None, "exits": None, "bridge_user": False,
         "foreign_xray": False, "listening": listening(), "ufw": ufw_status(),
     }
     if rep["installed"]:
         base, ex = load(BASE), load(EXITS, {"outbounds": []})
         ib = inbound_in(base)
         rep["mode"] = "bridge" if base.get("routing", {}).get("balancers") else "simple"
-        rep["sni"] = ib["streamSettings"]["realitySettings"]["serverNames"][0]
+        rs = ib["streamSettings"]["realitySettings"]
+        rep["server_names"] = list(rs.get("serverNames") or [])
+        rep["sni"] = current_sni(rs)
         rep["port"] = ib["port"]
         rep["users"] = len(ib["settings"]["clients"])
         # Выход, открытый для клиентов: простой режим, где один из пользователей — мост.
@@ -1864,7 +1879,8 @@ def status_report():
         except (OSError, ValueError, KeyError, AttributeError):
             rs = None
         if rs:
-            rep.update(installed=True, mode="exit", sni=rs["serverNames"][0], port=inbounds[0]["port"])
+            rep.update(installed=True, mode="exit", sni=current_sni(rs),
+                       server_names=list(rs.get("serverNames") or []), port=inbounds[0]["port"])
     return rep
 
 
@@ -1883,10 +1899,11 @@ def cmd_status(a):
     names = {"exit": "выход", "simple": "простой режим", "bridge": "мост"}
     roles = [names[k] for k, ok in rep["capabilities"].items() if ok]
     print("Годится как:", ", ".join(roles) or "ничего из вариантов")
+    snis = ", ".join(rep.get("server_names") or ([rep["sni"]] if rep["sni"] else [])) or "—"
     if rep["installed"] and rep["mode"] == "exit":
-        print(f'Режим: exit, SNI: {rep["sni"]}, порт: {rep["port"]}')
+        print(f'Режим: exit, SNI: {snis}, порт: {rep["port"]}')
     elif rep["installed"]:
-        print(f'Режим: {rep["mode"]}, SNI: {rep["sni"]}, порт: {rep["port"]}, '
+        print(f'Режим: {rep["mode"]}, SNI: {snis}, порт: {rep["port"]}, '
               f'пользователей: {rep["users"]}, выходов: {rep["exits"]}')
     else:
         print("Xray через эти скрипты не настроен.")
@@ -1930,13 +1947,18 @@ def health_report():
     if not st["capabilities"].get(st["mode"]):
         problems.append("хостер ограничил исходящий трафик, для этой роли его не хватает: нет связи с "
                         + ", ".join(blocked))
-    if st["sni"]:
-        cert = rep["sni"] = cert_report(st["sni"])
+    names = st.get("server_names") or ([st["sni"]] if st["sni"] else [])
+    for nm in names:
+        cert = cert_report(nm)
+        if nm == st["sni"]:
+            rep["sni"] = cert
         if not cert["ok"]:
-            problems.append(f'сайт для SNI {st["sni"]}: {cert["error"]}')
+            problems.append(f'сайт для SNI {nm}: {cert["error"]}')
         elif cert["days_left"] < SNI_CERT_MIN_DAYS:
-            warnings.append(f'сертификат сайта для SNI {st["sni"]} истекает через {cert["days_left"]} дн.: '
+            warnings.append(f'сертификат сайта для SNI {nm} истекает через {cert["days_left"]} дн.: '
                             "если владелец его не продлит, SNI придётся сменить")
+    if names and rep["sni"] is None:
+        rep["sni"] = {"domain": st["sni"], "ok": True, "days_left": None, "error": None}
     if st["mode"] == "bridge":
         rows = rep["exits"] = exits_health(load(EXITS, {"outbounds": []}))
         dead = [r["name"] for r in rows if not r["ok"]]

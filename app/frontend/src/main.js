@@ -115,7 +115,7 @@ function changeSniDialog(server, st) {
     manual.addEventListener('keydown', (e) => { if (e.key === 'Enter') ok(); });
     return [
       h('h3', {}, 'Сменить SNI'),
-      h('p', {}, `Сейчас: ${st.sni}. Укажите домен, под который будет маскироваться соединение.`),
+      h('p', {}, `Сейчас: ${sniText(st)}. Укажите домен, под который будет маскироваться соединение.`),
       scanBtn, scanHint, results, manual,
       h('label', { style: 'cursor:pointer;display:block;margin-top:10px' }, keepOld, 'Плавная смена: оставить прежний SNI рабочим'),
       h('p', { class: 'hint' },
@@ -462,6 +462,8 @@ function reachNotice(rep, fromName, toName) {
 const MODE_NAMES = { simple: 'простой режим', bridge: 'мост', exit: 'выход' };
 
 const stat = (label, value) => h('div', { class: 'stat' }, h('small', {}, label), h('b', {}, value));
+// SNI сервера: при плавной смене их два — актуальный и прежний, показываем оба.
+const sniText = (st) => (st.server_names && st.server_names.length ? st.server_names : [st.sni]).join(', ');
 
 function statusPanel(st) {
   const mem = st.memory;
@@ -473,7 +475,7 @@ function statusPanel(st) {
       st.installed && stat('Режим', st.bridge_user ? 'выход и для клиентов' : MODE_NAMES[st.mode]),
       !st.installed && stat('Годится как', Object.keys(MODE_NAMES)
         .filter((m) => st.capabilities?.[m]).map((m) => MODE_NAMES[m]).join(', ') || 'ничего из вариантов'),
-      st.installed && stat('SNI', st.sni),
+      st.installed && stat('SNI', sniText(st)),
       stat('Внешний IP', st.public_ip || '—'),
       stat('Система', st.os || '—'),
       stat('Работает', formatUptime(st.uptime_seconds)),
@@ -621,7 +623,7 @@ function maintenancePanel(server, st) {
     run(sniBtn, () => SetSNI(server.id, picked.domain, picked.keepOld), async () => {
       log.textContent += picked.keepOld
         ? `SNI изменён: ${st.sni} → ${picked.domain} (прежний оставлен рабочим).\n`
-        : `SNI изменён: ${st.sni} → ${picked.domain}.\n`;
+        : `SNI изменён: ${st.sni} → ${picked.domain}. Прежний SNI больше не принимается.\n`;
       if (st.mode !== 'exit' && !picked.keepOld) {
         log.textContent += 'Выдайте новые ссылки: список пользователей → ссылка/QR.\n';
       }
