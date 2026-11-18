@@ -115,6 +115,52 @@ expect("user без аргументов", cli("user")[0] == 1)
 expect("user неизвестный параметр", cli("user", "list", "--foo")[0] == 1)
 expect("неверный --host", cli("user", "list", "--host", "a;b")[0] == 1)
 
+# --- sub export: профиль пользователя для мобильного приложения
+base0 = open(os.path.join(tmp, "00_base.json")).read()
+state0 = open(ex.STATE).read()
+mode["x25519"] = "PrivateKey: PRIV\nPassword (PublicKey): PUBKEY123\nHash32: zzz\n"
+mode["api"] = True
+c, o, e = cli("sub", "export", "default", "--host", "vpn.example", "--json")
+p = json.loads(o) if c == 0 else {}
+expect("sub export: простой сервер — direct", c == 0 and p["version"] == 1
+       and p["endpoints"][0]["kind"] == "direct" and p["endpoints"][0]["country"] is None
+       and p["endpoints"][0]["default"] is True
+       and p["policy"] == {"allowBridge": False, "allowDirect": True}, (o, e))
+expect("sub export: ссылка с --host", p.get("endpoints", [{}])[0].get("link", "").startswith(
+    "vless://aaaaaaaa-0000-0000-0000-000000000000@vpn.example:443?type=tcp&security=reality&sni=site.example&pbk=PUBKEY123"), p)
+expect("sub export: лимиты и трафик", p.get("user") == {"name": "default", "expires": None, "limitBytes": None, "usedBytes": 2600}, p.get("user"))
+expect("sub export: нет пользователя", cli("sub", "export", "nope")[0] == 1)
+c, o, e = cli("sub", "export", "bridge")
+expect("sub export: служебный bridge отклонён", c == 1 and "служебный" in e, (o, e))
+expect("sub export: неверный --host", cli("sub", "export", "default", "--host", "a;b")[0] == 1)
+expect("sub export: неверные аргументы", cli("sub")[0] == 1 and cli("sub", "export")[0] == 1)
+c, o, e = cli("sub", "export", "default", "--host", "vpn.example")
+expect("sub export текстом: ссылка", c == 0 and "vless://" in o and "direct" in o, (o, e))
+# Отключённый пользователь профиль не получает.
+expect("user disable для проверки", cli("user", "disable", "default")[0] == 0)
+c, o, e = cli("sub", "export", "default")
+expect("sub export: отключён — отказ", c == 1 and "отключён" in e, (o, e))
+expect("user enable обратно", cli("user", "enable", "default")[0] == 0)
+expect("sub export: включён снова", cli("sub", "export", "default", "--json")[0] == 0)
+# Мост: kind bridge, страна — из встроенных списков, а из файла состояния — в приоритете.
+d = json.loads(base0)
+d["routing"]["balancers"] = [{"tag": "exits"}]
+d["routing"]["rules"] = [{"ruleTag": "builtin-domains", "domain": list(ex.RU_DOMAINS), "outboundTag": "direct"},
+                         {"ruleTag": "builtin-ips", "ip": ["geoip:ru", "geoip:private"], "outboundTag": "direct"},
+                         {"ruleTag": "to-exits", "inboundTag": ["in"], "balancerTag": "exits"}]
+open(os.path.join(tmp, "00_base.json"), "w").write(json.dumps(d))
+c, o, e = cli("sub", "export", "default", "--host", "vpn.example", "--json")
+p = json.loads(o) if c == 0 else {}
+expect("sub export: мост — kind bridge, страна по спискам", c == 0 and p["endpoints"][0]["kind"] == "bridge"
+       and p["endpoints"][0]["country"] == "ru" and p["policy"]["allowBridge"] is True, (o, e))
+open(ex.STATE, "a").write("country=kz\n")
+c, o, e = cli("sub", "export", "default", "--json")
+expect("sub export: страна из файла состояния в приоритете", c == 0 and json.loads(o)["endpoints"][0]["country"] == "kz", (o, e))
+open(os.path.join(tmp, "00_base.json"), "w").write(base0)
+open(ex.STATE, "w").write(state0)
+mode["api"] = False
+mode["x25519"] = ""
+
 c, o, e = cli("status", "--json")
 s = json.loads(o)
 expect("status: настроен, simple", c == 0 and s["installed"] and s["mode"] == "simple" and s["sni"] == "site.example" and s["users"] == 1 and s["exits"] == 0, o)
@@ -603,6 +649,7 @@ c, o, e = cli("direct", "country", "by", "--json")
 expect("country by: категории нет — только зона", c == 0 and json.loads(o)["domains"] == ["domain:by"], (o, e))
 c, o, e = cli("direct", "country", "ru", "--json")
 expect("country ru: прежний набор", c == 0 and json.loads(o)["domains"] == list(ex.RU_DOMAINS), o)
+expect("country: записана в файл состояния", "country=ru" in open(ex.STATE).read())
 expect("country: неверный код", cli("direct", "country", "rus")[0] == 1)
 for d in list(ex.RU_DOMAINS):
     cli("direct", "builtin", "remove", d)

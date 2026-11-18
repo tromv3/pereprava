@@ -29,6 +29,8 @@ export function ChooseBackupSave(arg1:string):Promise<string>;
 
 export function ChooseGeoFiles():Promise<Array<string>>;
 
+export function ChooseProfileSave(arg1:string):Promise<string>;
+
 export function ChooseXrayFile():Promise<string>;
 
 export function ClientConnect(arg1:main.ClientRequest):Promise<void>;
@@ -81,6 +83,8 @@ export function ResetUserTraffic(arg1:string,arg2:string):Promise<any>;
 
 export function RestoreBackup(arg1:string,arg2:string,arg3:string,arg4:boolean):Promise<any>;
 
+export function SaveProfileFile(arg1:string,arg2:{[key: string]: any}):Promise<void>;
+
 export function SaveServer(arg1:main.ServerInput):Promise<main.ServerView>;
 
 export function ScanSNI(arg1:string,arg2:string):Promise<any>;
@@ -112,3 +116,5 @@ export function UpdateXray(arg1:string):Promise<void>;
 export function UpdateXrayFromFile(arg1:string,arg2:string):Promise<void>;
 
 export function UseExit(arg1:string,arg2:string):Promise<void>;
+
+export function UserProfile(arg1:string,arg2:string,arg3:Array<string>):Promise<any>;

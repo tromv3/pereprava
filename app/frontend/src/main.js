@@ -6,6 +6,7 @@ import {
   LatestXray, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
   ClientConnect, ClientDisconnect, ClientEnableTUN, ClientState,
   ChooseGeoFiles, ChooseXrayFile, ImportXray, UpdateGeodataFromFiles, UpdateXrayFromFile,
+  ChooseProfileSave, SaveProfileFile, UserProfile,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
 
@@ -1314,6 +1315,76 @@ async function showLink(user) {
 
 const DISABLED_NAMES = { expired: 'истёк срок', traffic: 'исчерпан трафик', manual: 'отключён вручную' };
 
+// base64url без паддинга: так профиль упаковывается в deep-link pereprava://profile#... (docs/android-plan.md).
+function b64url(s) {
+  let bin = '';
+  new TextEncoder().encode(s).forEach((b) => { bin += String.fromCharCode(b); });
+  return btoa(bin).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+
+const ENDPOINT_KINDS = { bridge: 'через мост', direct: 'напрямую' };
+
+// Диалог «Профиль для приложения»: QR, deep-link и файл с профилем пользователя.
+// Можно отметить другие серверы с тем же логином — в приложении появится выбор точки.
+function profileDialog(server, u) {
+  return modal((close) => {
+    const others = state.servers.filter((s) => s.id !== server.id);
+    const boxes = others.map((s) => {
+      const cb = h('input', { type: 'checkbox', style: 'width:auto;margin-right:6px' });
+      cb._serverId = s.id;
+      return { cb, el: h('label', { style: 'cursor:pointer;display:block;margin-bottom:4px' }, cb, `${s.name} (${s.host})`) };
+    });
+    const result = h('div');
+    const err = h('p', { class: 'fail', style: 'min-height:1.2em;margin:6px 0 0' });
+    const buildBtn = h('button', { class: 'primary' }, 'Собрать профиль');
+
+    buildBtn.addEventListener('click', async () => {
+      err.textContent = '';
+      result.replaceChildren();
+      buildBtn.disabled = true;
+      try {
+        const also = boxes.filter((b) => b.cb.checked).map((b) => b.cb._serverId);
+        const { profile, problems } = await UserProfile(server.id, u.name, also);
+        const deep = 'pereprava://profile#' + b64url(JSON.stringify(profile));
+        let qr = null;
+        try { qr = await QRCode(deep); } catch { /* длинная ссылка не влезает в QR — есть файл и копирование */ }
+        const saveBtn = h('button', {}, 'Сохранить файл');
+        saveBtn.addEventListener('click', async () => {
+          try {
+            const path = await ChooseProfileSave(u.name);
+            if (!path) return;
+            await SaveProfileFile(path, profile);
+            saveBtn.textContent = 'Сохранено';
+          } catch (e) { err.textContent = msg(e); }
+        });
+        result.replaceChildren(
+          ...(problems && problems.length ? [h('div', { class: 'error' }, 'Не удалось добавить: ' + problems.join('; '))] : []),
+          qr ? h('img', { class: 'qr', src: qr, alt: 'QR профиля' })
+             : h('p', { class: 'hint' }, 'Ссылка не поместилась в QR — передайте файлом или кнопкой «Копировать».'),
+          h('ul', {}, profile.endpoints.map((e) => h('li', {},
+            `${ENDPOINT_KINDS[e.kind] || e.kind}${e.country ? `, страна ${e.country}` : ''}${e.default ? ' — по умолчанию' : ''}`))),
+          h('div', { class: 'modal-actions' },
+            h('button', { onclick: (e) => { ClipboardSetText(deep); e.target.textContent = 'Скопировано'; } }, 'Копировать ссылку'),
+            saveBtn));
+      } catch (e) {
+        err.textContent = msg(e);
+      } finally {
+        buildBtn.disabled = false;
+      }
+    });
+
+    return [
+      h('h3', {}, `Профиль для приложения: ${u.name}`),
+      h('p', { class: 'hint' }, 'Профиль — всё, что нужно Android-приложению «Переправа»: адрес сервера, ссылка, лимиты и разрешённые варианты подключения. Отправьте пользователю QR или файл — настраивать ничего не нужно.'),
+      boxes.length ? h('p', { style: 'margin:10px 0 4px' }, 'Добавить такой же логин с других серверов (выбор «мост или напрямую» и страны в приложении):') : null,
+      ...boxes.map((b) => b.el),
+      h('div', { class: 'row', style: 'margin:10px 0' }, buildBtn),
+      err, result,
+      h('div', { class: 'modal-actions' }, h('button', { onclick: () => close() }, 'Закрыть')),
+    ];
+  });
+}
+
 // Дата из <input type=date> как конец этого дня по времени компьютера, с поясом: сервер может жить в другом.
 function endOfDayISO(date) {
   const off = -new Date(`${date}T23:59:59`).getTimezoneOffset();
@@ -1398,6 +1469,7 @@ function usersPanel(server, st = {}) {
           h('td', { class: 'actions' },
             h('button', { disabled: !u.link, onclick: () => showLink(u) }, 'Ссылка и QR'),
             ...(u.name === 'bridge' && st.bridge_user ? [] : [
+              h('button', { disabled: !u.link, onclick: () => profileDialog(server, u) }, 'Профиль'),
               h('button', { onclick: async () => { if (await limitsDialog(server, u)) load(); } }, 'Ограничения'),
               u.disabled
                 ? h('button', { onclick: () => toggle(u, true) }, 'Включить')

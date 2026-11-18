@@ -117,6 +117,7 @@ check_port
 remember_before
 state_set role bridge
 state_set port "$PORT"
+state_set country "$COUNTRY"
 
 apt-get update -q
 apt-get install -y -q curl openssl ufw python3

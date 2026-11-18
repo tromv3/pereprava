@@ -1378,6 +1378,127 @@ func (a *App) userTool(id string, args ...string) (any, error) {
 	return a.tool(id, false, append(args, "--host", srv.Host)...)
 }
 
+// UserProfile собирает профиль пользователя для мобильного приложения: с сервера id и,
+// если переданы also, такой же логин с других серверов (в приложении это выбор
+// «мост или напрямую» и страны). Ответ: {"profile": ..., "problems": [...]} —
+// проблемы по дополнительным серверам не мешают основному профилю.
+func (a *App) UserProfile(id, name string, also []string) (any, error) {
+	name = strings.TrimSpace(name)
+	if !reUser.MatchString(name) {
+		return nil, errors.New("в имени допустимы латинские буквы, цифры, пробел, - и _")
+	}
+	primary, err := a.userTool(id, "sub", "export", name, "--json")
+	if err != nil {
+		return nil, err
+	}
+	profile, ok := primary.(map[string]any)
+	if !ok {
+		return nil, errors.New("сервер вернул неожиданный ответ: обновите exitctl на нём (раздел «Обслуживание»)")
+	}
+	problems := []string{}
+	var others []map[string]any
+	for _, otherID := range also {
+		if otherID == id {
+			continue
+		}
+		srv, err := a.store.Get(otherID)
+		if err != nil {
+			continue
+		}
+		p, err := a.userTool(otherID, "sub", "export", name, "--json")
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", srv.Name, err))
+			continue
+		}
+		if m, ok := p.(map[string]any); ok {
+			others = append(others, m)
+		}
+	}
+	return map[string]any{"profile": mergeUserProfiles(profile, others), "problems": problems}, nil
+}
+
+// mergeUserProfiles объединяет профили одного логина с разных серверов: endpoint'ы
+// складываются без повторов (по id), политика пересчитывается по ним,
+// default остаётся за первым endpoint'ом основного сервера.
+func mergeUserProfiles(primary map[string]any, others []map[string]any) map[string]any {
+	endpoints, _ := primary["endpoints"].([]any)
+	seen := map[string]bool{}
+	first := true
+	for _, e := range endpoints {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, _ := m["id"].(string); id != "" {
+			seen[id] = true
+		}
+		m["default"] = first
+		first = false
+	}
+	for _, p := range others {
+		list, _ := p["endpoints"].([]any)
+		for _, e := range list {
+			m, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			id, _ := m["id"].(string)
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			m["default"] = false
+			endpoints = append(endpoints, m)
+		}
+	}
+	policy := map[string]any{"allowBridge": false, "allowDirect": false}
+	for _, e := range endpoints {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch m["kind"] {
+		case "bridge":
+			policy["allowBridge"] = true
+		case "direct":
+			policy["allowDirect"] = true
+		}
+	}
+	primary["endpoints"] = endpoints
+	primary["policy"] = policy
+	return primary
+}
+
+// SaveProfileFile сохраняет профиль пользователя в файл для передачи на телефон.
+func (a *App) SaveProfileFile(path string, profile map[string]any) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("не выбран файл")
+	}
+	data, err := json.MarshalIndent(profile, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+// ChooseProfileSave спрашивает, куда сохранить профиль. Пустая строка — пользователь отменил.
+func (a *App) ChooseProfileSave(userName string) (string, error) {
+	name := strings.Map(func(r rune) rune {
+		if strings.ContainsRune(`\\/:*?"<>|`, r) {
+			return '-'
+		}
+		return r
+	}, userName)
+	if name == "" {
+		name = "user"
+	}
+	return runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:           "Сохранить профиль для приложения",
+		DefaultFilename: fmt.Sprintf("pereprava-%s.pereprava-profile", name),
+		Filters:         []runtime.FileFilter{{DisplayName: "Профиль «Переправы» (*.pereprava-profile)", Pattern: "*.pereprava-profile"}},
+	})
+}
+
 // QRCode рисует ссылку как PNG в data-URL. Работает локально, ссылка никуда не отправляется.
 func (a *App) QRCode(text string) (string, error) {
 	png, err := qrcode.Encode(text, qrcode.Medium, 320)

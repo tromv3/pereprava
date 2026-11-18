@@ -31,6 +31,7 @@
   exitctl user disable|enable <имя> [--json]       отключить или включить (ссылка не меняется)
   exitctl user reset <имя> [--json]                обнулить накопленный трафик пользователя
   exitctl user enforce [--json]                    учесть трафик и отключить вышедших за пределы (cron)
+  exitctl sub export <имя> [--host АДРЕС] [--json] профиль пользователя для мобильного приложения
   exitctl status [--json]                          состояние сервера и Xray
   exitctl health [--json]                          проблемы сервера: Xray, выходы, сертификат SNI, исходящий трафик (код 1 — есть проблемы)
   exitctl exit open [--json]                       выход — ещё и для клиентов (на выходе; ссылка моста не меняется)
@@ -679,6 +680,8 @@ def cmd_builtin(a):
     set_builtin(base, domains, ips)
     with contextlib.redirect_stdout(sys.stderr if as_json else sys.stdout):
         apply_routing_change(base, ex, ex)
+    if a[0] == "country":
+        state_set("country", cc)  # страна моста попадает в профили пользователей (sub export)
     if as_json:
         print(json.dumps({"domains": domains, "ips": ips}, ensure_ascii=False, indent=2))
     else:
@@ -1662,6 +1665,84 @@ def cmd_user(a):
                   f'до {fmt_date(user["expires"])}.')
 
 
+def server_country(base, mode):
+    """Страна сервера для профиля: из файла состояния (новые установки и «direct country»)
+    или по встроенным спискам «напрямую» моста. None, если определить нельзя."""
+    cc = state_get("country")
+    if re.fullmatch(r"[a-z]{2}", cc):
+        return cc
+    if mode == "bridge":
+        _, ri = builtin_rules(base)
+        for v in (ri or {}).get("ip", []):
+            m = re.fullmatch(r"geoip:([a-z]{2})", str(v))
+            if m:
+                return m.group(1)
+    return None
+
+
+def profile_export(name, host):
+    """Профиль пользователя для мобильного приложения: ссылка, лимиты, что разрешено выбирать.
+
+    Формат описан в docs/android-plan.md: версия, пользователь с лимитами, список endpoint'ов
+    (здесь — один, этот сервер) и политика выбора. Профили одного логина с разных серверов
+    объединяет приложение администратора: оттуда выбор «мост или напрямую» и стран.
+    """
+    base = load(BASE)
+    meta = load_meta()
+    reconcile(meta, base)
+    if name == BRIDGE_USER:
+        die(f'«{BRIDGE_USER}» — служебный пользователь моста, профиль для него не выдаётся')
+    client = next((c for c in inbound_in(base)["settings"]["clients"] if client_name(c) == name), None)
+    if client is None:
+        m = meta["users"].get(name)
+        if m and m.get("disabled"):
+            die(f'пользователь «{name}» отключён ({LIMIT_REASONS.get(m["disabled"], "отключён")}): включите его')
+        die(f'нет пользователя «{name}»')
+    host = host or detect_server_ip()
+    pub = public_key(base)
+    if not host or not pub:
+        die("не удалось собрать ссылку: нет адреса сервера (--host) или публичного ключа Reality")
+    mode = "bridge" if base.get("routing", {}).get("balancers") else "simple"
+    kind = "bridge" if mode == "bridge" else "direct"
+    m = meta["users"].get(name, {})
+    t = (user_traffic() or {}).get(name, {})
+    link = client_link(base, client, host, pub)
+    return {
+        "version": 1,
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "user": {"name": name, "expires": m.get("expires"), "limitBytes": m.get("limit"),
+                 "usedBytes": m.get("used", 0) + t.get("uplink", 0) + t.get("downlink", 0)},
+        "endpoints": [{"id": f"{kind}-{host}", "kind": kind, "country": server_country(base, mode),
+                       "link": link, "default": True}],
+        "policy": {"allowBridge": kind == "bridge", "allowDirect": kind == "direct"},
+    }
+
+
+def cmd_sub(a):
+    usage = "используйте: exitctl sub export <имя> [--host АДРЕС] [--json]"
+    as_json = "--json" in a
+    a = [x for x in a if x != "--json"]
+    host = None
+    if "--host" in a:
+        i = a.index("--host")
+        host = a[i + 1] if i + 1 < len(a) else None
+        a = a[:i] + a[i + 2:]
+        if host is None or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+            die(usage)
+    if len(a) != 2 or a[0] != "export":
+        die(usage)
+    name = clean_name(a[1])
+    if not name:
+        die("в имени нужны латинские буквы, цифры, - или _")
+    profile = profile_export(name, host)
+    if as_json:
+        print(json.dumps(profile, ensure_ascii=False, indent=2))
+    else:
+        ep = profile["endpoints"][0]
+        print(f'Профиль «{name}»: {ep["kind"]}' + (f', страна {ep["country"]}' if ep["country"] else ""))
+        print(ep["link"])
+
+
 def read_file(path):
     try:
         with open(path) as f:
@@ -1785,6 +1866,26 @@ def ufw_status():
 
 def state_lines():
     return (read_file(STATE) or "").splitlines()
+
+
+def state_get(key):
+    """Значение key= из файла состояния установщиков ('' если файла или ключа нет)."""
+    for line in state_lines():
+        if line.startswith(key + "="):
+            return line[len(key) + 1:]
+    return ""
+
+
+def state_set(key, value):
+    """Записать key=value в файл состояния (как state_set в установщиках), атомарно."""
+    lines = [l for l in state_lines() if not l.startswith(key + "=")]
+    lines.append(f"{key}={value}")
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("".join(x + "\n" for x in lines))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE)
 
 
 def ufw_add(args):
@@ -2444,6 +2545,8 @@ def dispatch(a):
         cmd_sni(a[1:])
     elif c == "user":
         cmd_user(a[1:])
+    elif c == "sub":
+        cmd_sub(a[1:])
     elif c == "status":
         cmd_status(a[1:])
     elif c == "exit":

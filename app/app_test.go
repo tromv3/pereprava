@@ -106,3 +106,47 @@ func TestPortBusy(t *testing.T) {
 		t.Fatal("без данных — свободен")
 	}
 }
+
+func TestMergeUserProfiles(t *testing.T) {
+	primary := map[string]any{
+		"version": 1,
+		"user":    map[string]any{"name": "phone"},
+		"endpoints": []any{
+			map[string]any{"id": "bridge-203.0.113.9", "kind": "bridge", "country": "ru", "link": "vless://a", "default": true},
+		},
+		"policy": map[string]any{"allowBridge": true, "allowDirect": false},
+	}
+	other := map[string]any{
+		"endpoints": []any{
+			map[string]any{"id": "direct-198.51.100.7", "kind": "direct", "link": "vless://b", "default": true},
+		},
+	}
+	dup := map[string]any{
+		"endpoints": []any{
+			map[string]any{"id": "bridge-203.0.113.9", "kind": "bridge", "link": "vless://a"},
+		},
+	}
+	p := mergeUserProfiles(primary, []map[string]any{other, dup})
+	eps, _ := p["endpoints"].([]any)
+	if len(eps) != 2 {
+		t.Fatalf("endpoint'ов должно быть 2 без повторов: %+v", eps)
+	}
+	if eps[0].(map[string]any)["default"] != true || eps[1].(map[string]any)["default"] != false {
+		t.Errorf("default — только у первого: %+v", eps)
+	}
+	pol, _ := p["policy"].(map[string]any)
+	if pol["allowBridge"] != true || pol["allowDirect"] != true {
+		t.Errorf("политика пересчитана по всем endpoint'ам: %v", pol)
+	}
+	if p["user"].(map[string]any)["name"] != "phone" {
+		t.Error("данные пользователя потеряны")
+	}
+
+	single := mergeUserProfiles(map[string]any{"endpoints": []any{
+		map[string]any{"id": "direct-1.2.3.4", "kind": "direct", "link": "vless://x"},
+	}}, nil)
+	pol, _ = single["policy"].(map[string]any)
+	if pol["allowBridge"] != false || pol["allowDirect"] != true {
+		t.Errorf("один простой сервер: только direct: %v", pol)
+	}
+}
