@@ -54,6 +54,10 @@ export function ChooseGeoFiles() {
   return window['go']['main']['App']['ChooseGeoFiles']();
 }
 
+export function ChooseProfileSave(arg1) {
+  return window['go']['main']['App']['ChooseProfileSave'](arg1);
+}
+
 export function ChooseXrayFile() {
   return window['go']['main']['App']['ChooseXrayFile']();
 }
@@ -158,6 +162,10 @@ export function RestoreBackup(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['RestoreBackup'](arg1, arg2, arg3, arg4);
 }
 
+export function SaveProfileFile(arg1, arg2) {
+  return window['go']['main']['App']['SaveProfileFile'](arg1, arg2);
+}
+
 export function SaveServer(arg1) {
   return window['go']['main']['App']['SaveServer'](arg1);
 }
@@ -190,6 +198,26 @@ export function Status(arg1) {
   return window['go']['main']['App']['Status'](arg1);
 }
 
+export function SubDisable(arg1) {
+  return window['go']['main']['App']['SubDisable'](arg1);
+}
+
+export function SubEnable(arg1, arg2) {
+  return window['go']['main']['App']['SubEnable'](arg1, arg2);
+}
+
+export function SubRevokeToken(arg1, arg2) {
+  return window['go']['main']['App']['SubRevokeToken'](arg1, arg2);
+}
+
+export function SubRotateToken(arg1, arg2) {
+  return window['go']['main']['App']['SubRotateToken'](arg1, arg2);
+}
+
+export function SubStatus(arg1) {
+  return window['go']['main']['App']['SubStatus'](arg1);
+}
+
 export function TrustServer(arg1, arg2) {
   return window['go']['main']['App']['TrustServer'](arg1, arg2);
 }
@@ -220,4 +248,8 @@ export function UpdateXrayFromFile(arg1, arg2) {
 
 export function UseExit(arg1, arg2) {
   return window['go']['main']['App']['UseExit'](arg1, arg2);
+}
+
+export function UserProfile(arg1, arg2, arg3) {
+  return window['go']['main']['App']['UserProfile'](arg1, arg2, arg3);
 }

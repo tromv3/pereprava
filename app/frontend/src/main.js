@@ -6,6 +6,8 @@ import {
   LatestXray, UpdateGeodata, UpdateTool, UpdateXray, UseExit,
   ClientConnect, ClientDisconnect, ClientEnableTUN, ClientState,
   ChooseGeoFiles, ChooseXrayFile, ImportXray, UpdateGeodataFromFiles, UpdateXrayFromFile,
+  ChooseProfileSave, SaveProfileFile, UserProfile,
+  SubStatus, SubEnable, SubDisable, SubRotateToken,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
 
@@ -498,8 +500,8 @@ function egressWarning(st) {
 function renderServerBody(body, server, st) {
   const panels = !st.installed ? [installPanel(server, st)]
     : st.mode === 'exit' ? [exitInfoPanel(server, st)]
-      : st.mode === 'bridge' ? [exitsPanel(server), usersPanel(server, st), directPanel(server), migratePanel(server, st)]
-        : [st.bridge_user && exitInfoPanel(server, st), usersPanel(server, st), migratePanel(server, st)].filter(Boolean);
+      : st.mode === 'bridge' ? [exitsPanel(server), usersPanel(server, st), subPanel(server), directPanel(server), migratePanel(server, st)]
+        : [st.bridge_user && exitInfoPanel(server, st), usersPanel(server, st), subPanel(server), migratePanel(server, st)].filter(Boolean);
   if (st.installed) panels.push(maintenancePanel(server, st));
   body.replaceChildren(...[healthNotice(server.id), egressWarning(st), statusPanel(st), ...panels].filter(Boolean));
   // Открытый сервер проверяем заново, если результат старше 5 минут.
@@ -1312,7 +1314,157 @@ async function showLink(user) {
   ]);
 }
 
+// --- Раздача профилей (подписка): HTTPS на отдельном порту, токен на пользователя ---
+function subPanel(server) {
+  const box = h('div', {}, h('p', { class: 'hint' }, 'Загружаю состояние раздачи...'));
+  const errorBox = h('div');
+  const showError = (e) => errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+
+  function render(rep) {
+    const rows = [];
+    if (!rep.enabled) {
+      const port = h('input', { type: 'number', min: '1', max: '65535', value: '8443', style: 'width:90px' });
+      const enableBtn = h('button', { class: 'primary' }, 'Включить');
+      enableBtn.addEventListener('click', async () => {
+        errorBox.replaceChildren();
+        const ok = await confirmDialog('Включить раздачу профилей?',
+          `На сервере откроется отдельный HTTPS-порт ${port.value || 8443}: по ссылке с личным токеном каждый пользователь получает свой актуальный профиль. Порт Reality и маскировка не затрагиваются. Сертификат self-signed: приложение запоминает его отпечаток при импорте профиля.`,
+          'Включить');
+        if (!ok) return;
+        enableBtn.disabled = true;
+        try {
+          await SubEnable(server.id, Number(port.value) || 0);
+          await load();
+        } catch (e) {
+          showError(e);
+        } finally {
+          enableBtn.disabled = false;
+        }
+      });
+      rows.push(h('p', { class: 'hint' }, 'Раздача выключена. Когда включена, приложение пользователя само получает актуальный профиль (смена SNI, новые точки), а тот же адрес работает как подписка в v2rayNG, Happ и Hiddify (параметр ?format=v2ray).'),
+        h('div', { class: 'row' }, h('span', {}, 'Порт:'), port, enableBtn));
+    } else {
+      const disableBtn = h('button', { class: 'danger' }, 'Выключить');
+      disableBtn.addEventListener('click', async () => {
+        const ok = await confirmDialog('Выключить раздачу профилей?',
+          'Ссылки подписок перестанут отвечать, приложения перестанут получать обновления (последний профиль продолжит работать). Токены сохранятся: при повторном включении ссылки заработают снова.',
+          'Выключить');
+        if (!ok) return;
+        errorBox.replaceChildren();
+        try {
+          await SubDisable(server.id);
+          await load();
+        } catch (e) { showError(e); }
+      });
+      rows.push(h('p', {}, `Включена: https://${rep.host}:${rep.port}/s/<токен>`),
+        h('p', { class: 'hint' }, `Отпечаток сертификата (sha256): ${rep.certSha256 ? rep.certSha256.slice(0, 23) + '…' : '—'}. Токенов: ${(rep.tokens || []).length}. Ссылку пользователя даёт кнопка «Профиль» у пользователя выше.`),
+        h('div', { class: 'row' }, disableBtn));
+    }
+    box.replaceChildren(...rows);
+  }
+
+  async function load() {
+    try {
+      render(await SubStatus(server.id));
+    } catch (e) {
+      box.replaceChildren();
+      showError(e);
+    }
+  }
+
+  load();
+  return h('div', { class: 'panel' }, h('h3', {}, 'Раздача профилей'), errorBox, box);
+}
+
 const DISABLED_NAMES = { expired: 'истёк срок', traffic: 'исчерпан трафик', manual: 'отключён вручную' };
+
+// base64url без паддинга: так профиль упаковывается в deep-link pereprava://profile#... (docs/android-plan.md).
+function b64url(s) {
+  let bin = '';
+  new TextEncoder().encode(s).forEach((b) => { bin += String.fromCharCode(b); });
+  return btoa(bin).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+
+const ENDPOINT_KINDS = { bridge: 'через мост', direct: 'напрямую' };
+
+// Диалог «Профиль для приложения»: QR, deep-link и файл с профилем пользователя.
+// Можно отметить другие серверы с тем же логином — в приложении появится выбор точки.
+function profileDialog(server, u) {
+  return modal((close) => {
+    const others = state.servers.filter((s) => s.id !== server.id);
+    const boxes = others.map((s) => {
+      const cb = h('input', { type: 'checkbox', style: 'width:auto;margin-right:6px' });
+      cb._serverId = s.id;
+      return { cb, el: h('label', { style: 'cursor:pointer;display:block;margin-bottom:4px' }, cb, `${s.name} (${s.host})`) };
+    });
+    const result = h('div');
+    const err = h('p', { class: 'fail', style: 'min-height:1.2em;margin:6px 0 0' });
+    const buildBtn = h('button', { class: 'primary' }, 'Собрать профиль');
+
+    buildBtn.addEventListener('click', async () => {
+      err.textContent = '';
+      result.replaceChildren();
+      buildBtn.disabled = true;
+      try {
+        const also = boxes.filter((b) => b.cb.checked).map((b) => b.cb._serverId);
+        const { profile, problems } = await UserProfile(server.id, u.name, also);
+        const deep = 'pereprava://profile#' + b64url(JSON.stringify(profile));
+        let qr = null;
+        try { qr = await QRCode(deep); } catch { /* длинная ссылка не влезает в QR — есть файл и копирование */ }
+        const saveBtn = h('button', {}, 'Сохранить файл');
+        saveBtn.addEventListener('click', async () => {
+          try {
+            const path = await ChooseProfileSave(u.name);
+            if (!path) return;
+            await SaveProfileFile(path, profile);
+            saveBtn.textContent = 'Сохранено';
+          } catch (e) { err.textContent = msg(e); }
+        });
+        const withSub = profile.endpoints.some((e) => e.subscription);
+        const rotateBtn = withSub && h('button', {}, 'Перевыпустить ссылку подписки');
+        if (rotateBtn) {
+          rotateBtn.addEventListener('click', async () => {
+            const ok = await confirmDialog('Перевыпустить ссылку подписки?',
+              `Прежняя ссылка «${u.name}» перестанет отвечать: устройство с ней перестанет получать обновления профиля (последний профиль продолжит работать). Новую ссылку нужно передать пользователю заново.`,
+              'Перевыпустить');
+            if (!ok) return;
+            try {
+              await SubRotateToken(server.id, u.name);
+              buildBtn.click(); // собрать профиль заново: QR и ссылка уже с новым токеном
+            } catch (e) { err.textContent = msg(e); }
+          });
+        }
+        result.replaceChildren(
+          ...(problems && problems.length ? [h('div', { class: 'error' }, 'Не удалось добавить: ' + problems.join('; '))] : []),
+          qr ? h('img', { class: 'qr', src: qr, alt: 'QR профиля' })
+             : h('p', { class: 'hint' }, 'Ссылка не поместилась в QR — передайте файлом или кнопкой «Копировать».'),
+          h('ul', {}, profile.endpoints.map((e) => h('li', {},
+            `${ENDPOINT_KINDS[e.kind] || e.kind}${e.country ? `, страна ${e.country}` : ''}${e.default ? ' — по умолчанию' : ''}${e.subscription ? ' (↻ автообновление)' : ''}`))),
+          h('p', { class: 'hint' }, withSub
+            ? 'Раздача профилей включена: приложение будет обновлять профиль само.'
+            : 'Раздача профилей на сервере выключена: при смене SNI или адреса профиль нужно будет выдать заново. Включается на странице сервера, «Раздача профилей».'),
+          h('div', { class: 'modal-actions' },
+            h('button', { onclick: (e) => { ClipboardSetText(deep); e.target.textContent = 'Скопировано'; } }, 'Копировать ссылку'),
+            saveBtn,
+            rotateBtn));
+      } catch (e) {
+        err.textContent = msg(e);
+      } finally {
+        buildBtn.disabled = false;
+      }
+    });
+
+    return [
+      h('h3', {}, `Профиль для приложения: ${u.name}`),
+      h('p', { class: 'hint' }, 'Профиль — всё, что нужно Android-приложению «Переправа»: адрес сервера, ссылка, лимиты и разрешённые варианты подключения. Отправьте пользователю QR или файл — настраивать ничего не нужно.'),
+      boxes.length ? h('p', { style: 'margin:10px 0 4px' }, 'Добавить такой же логин с других серверов (выбор «мост или напрямую» и страны в приложении):') : null,
+      ...boxes.map((b) => b.el),
+      h('div', { class: 'row', style: 'margin:10px 0' }, buildBtn),
+      err, result,
+      h('div', { class: 'modal-actions' }, h('button', { onclick: () => close() }, 'Закрыть')),
+    ];
+  });
+}
 
 // Дата из <input type=date> как конец этого дня по времени компьютера, с поясом: сервер может жить в другом.
 function endOfDayISO(date) {
@@ -1398,6 +1550,7 @@ function usersPanel(server, st = {}) {
           h('td', { class: 'actions' },
             h('button', { disabled: !u.link, onclick: () => showLink(u) }, 'Ссылка и QR'),
             ...(u.name === 'bridge' && st.bridge_user ? [] : [
+              h('button', { disabled: !u.link, onclick: () => profileDialog(server, u) }, 'Профиль'),
               h('button', { onclick: async () => { if (await limitsDialog(server, u)) load(); } }, 'Ограничения'),
               u.disabled
                 ? h('button', { onclick: () => toggle(u, true) }, 'Включить')

@@ -115,6 +115,124 @@ expect("user без аргументов", cli("user")[0] == 1)
 expect("user неизвестный параметр", cli("user", "list", "--foo")[0] == 1)
 expect("неверный --host", cli("user", "list", "--host", "a;b")[0] == 1)
 
+# --- sub export: профиль пользователя для мобильного приложения
+base0 = open(os.path.join(tmp, "00_base.json")).read()
+state0 = open(ex.STATE).read()
+mode["x25519"] = "PrivateKey: PRIV\nPassword (PublicKey): PUBKEY123\nHash32: zzz\n"
+mode["api"] = True
+c, o, e = cli("sub", "export", "default", "--host", "vpn.example", "--json")
+p = json.loads(o) if c == 0 else {}
+expect("sub export: простой сервер — direct", c == 0 and p["version"] == 1
+       and p["endpoints"][0]["kind"] == "direct" and p["endpoints"][0]["country"] is None
+       and p["endpoints"][0]["default"] is True
+       and p["policy"] == {"allowBridge": False, "allowDirect": True}, (o, e))
+expect("sub export: ссылка с --host", p.get("endpoints", [{}])[0].get("link", "").startswith(
+    "vless://aaaaaaaa-0000-0000-0000-000000000000@vpn.example:443?type=tcp&security=reality&sni=site.example&pbk=PUBKEY123"), p)
+expect("sub export: лимиты и трафик", p.get("user") == {"name": "default", "expires": None, "limitBytes": None, "usedBytes": 2600}, p.get("user"))
+expect("sub export: нет пользователя", cli("sub", "export", "nope")[0] == 1)
+c, o, e = cli("sub", "export", "bridge")
+expect("sub export: служебный bridge отклонён", c == 1 and "служебный" in e, (o, e))
+expect("sub export: неверный --host", cli("sub", "export", "default", "--host", "a;b")[0] == 1)
+expect("sub export: неверные аргументы", cli("sub")[0] == 1 and cli("sub", "export")[0] == 1)
+c, o, e = cli("sub", "export", "default", "--host", "vpn.example")
+expect("sub export текстом: ссылка", c == 0 and "vless://" in o and "direct" in o, (o, e))
+# Отключённый пользователь профиль не получает.
+expect("user disable для проверки", cli("user", "disable", "default")[0] == 0)
+c, o, e = cli("sub", "export", "default")
+expect("sub export: отключён — отказ", c == 1 and "отключён" in e, (o, e))
+expect("user enable обратно", cli("user", "enable", "default")[0] == 0)
+expect("sub export: включён снова", cli("sub", "export", "default", "--json")[0] == 0)
+# Мост: kind bridge, страна — из встроенных списков, а из файла состояния — в приоритете.
+d = json.loads(base0)
+d["routing"]["balancers"] = [{"tag": "exits"}]
+d["routing"]["rules"] = [{"ruleTag": "builtin-domains", "domain": list(ex.RU_DOMAINS), "outboundTag": "direct"},
+                         {"ruleTag": "builtin-ips", "ip": ["geoip:ru", "geoip:private"], "outboundTag": "direct"},
+                         {"ruleTag": "to-exits", "inboundTag": ["in"], "balancerTag": "exits"}]
+open(os.path.join(tmp, "00_base.json"), "w").write(json.dumps(d))
+c, o, e = cli("sub", "export", "default", "--host", "vpn.example", "--json")
+p = json.loads(o) if c == 0 else {}
+expect("sub export: мост — kind bridge, страна по спискам", c == 0 and p["endpoints"][0]["kind"] == "bridge"
+       and p["endpoints"][0]["country"] == "ru" and p["policy"]["allowBridge"] is True, (o, e))
+open(ex.STATE, "a").write("country=kz\n")
+c, o, e = cli("sub", "export", "default", "--json")
+expect("sub export: страна из файла состояния в приоритете", c == 0 and json.loads(o)["endpoints"][0]["country"] == "kz", (o, e))
+open(os.path.join(tmp, "00_base.json"), "w").write(base0)
+open(ex.STATE, "w").write(state0)
+
+# --- раздача профилей (подписка)
+ex.SUB_UNIT = os.path.join(tmp, "pereprava-sub.service")
+ex.SUB_META = os.path.join(tmp, "exitctl-sub.json")
+ex.SUB_CERT, ex.SUB_KEY = os.path.join(tmp, "sub-tls.crt"), os.path.join(tmp, "sub-tls.key")
+def fake_cert():
+    open(ex.SUB_CERT, "w").write("crt"); open(ex.SUB_KEY, "w").write("key")
+    return "ab12cdef"
+ex.ensure_sub_cert = fake_cert
+c, o, e = cli("sub", "status", "--json")
+expect("sub status: выключена", c == 0 and json.loads(o)["enabled"] is False, (o, e))
+expect("sub token без раздачи — отказ", cli("sub", "token", "default")[0] == 1)
+st0 = open(ex.STATE).read()
+open(ex.STATE, "w").write(st0 + "port=443\n")
+c, o, e = cli("sub", "enable", "--port", "443")
+expect("sub enable: порт клиентов отклонён", c == 1 and "занят подключениями" in e, (o, e))
+open(ex.STATE, "w").write(st0)
+c, o, e = cli("sub", "enable", "--json")
+r = json.loads(o) if c == 0 else {}
+expect("sub enable: порт, адрес, отпечаток", c == 0 and r["enabled"] is True and r["port"] == 8443
+       and r["host"] == "203.0.113.9" and r["certSha256"] == "ab12cdef", (o, e))
+expect("sub enable: unit и правило ufw записаны", os.path.exists(ex.SUB_UNIT)
+       and "ufw=8443/tcp" in open(ex.STATE).read(), open(ex.STATE).read())
+expect("sub enable: повтор отклонён", cli("sub", "enable")[0] == 1)
+c, o, e = cli("sub", "token", "default", "--json")
+r = json.loads(o) if c == 0 else {}
+expect("sub token: url", c == 0 and r["url"].startswith("https://203.0.113.9:8443/s/"), (o, e))
+url1 = r.get("url", "")
+c, o, e = cli("sub", "token", "default", "--json")
+expect("sub token: повторный тот же", c == 0 and json.loads(o)["url"] == url1, o)
+expect("sub token: нет пользователя", cli("sub", "token", "nope")[0] == 1)
+tok = url1.rsplit("/s/", 1)[1]
+meta = ex.sub_meta()
+code, hdr, body = ex.sub_response(meta, "/s/" + tok)
+p = json.loads(body) if code == 200 else {}
+expect("sub_response: профиль по токену", code == 200 and p["user"]["name"] == "default"
+       and p["endpoints"][0]["link"].startswith("vless://aaaaaaaa-0000-0000-0000-000000000000@203.0.113.9:443"), (code, body))
+expect("sub_response: подписка вложена в профиль", p["endpoints"][0]["subscription"]["url"] == url1
+       and p["endpoints"][0]["subscription"]["certSha256"] == "ab12cdef", p["endpoints"][0])
+expect("sub_response: ETag → 304", ex.sub_response(meta, "/s/" + tok, hdr.get("ETag"))[0] == 304, hdr)
+code, hdr, body = ex.sub_response(meta, "/s/" + tok + "?format=v2ray")
+import base64 as b64mod
+expect("sub_response: формат v2ray", code == 200 and "vless://" in b64mod.b64decode(body).decode(), body[:60])
+expect("sub_response: чужой токен 404", ex.sub_response(meta, "/s/" + "x" * 43)[0] == 404)
+expect("sub_response: другой путь 404", ex.sub_response(meta, "/")[0] == 404)
+# export --sub вкладывает подписку, когда раздача включена
+c, o, e = cli("sub", "export", "default", "--host", "vpn.example", "--sub", "--json")
+p = json.loads(o) if c == 0 else {}
+expect("sub export --sub: подписка в endpoint", c == 0 and p["endpoints"][0].get("subscription", {}).get("url") == url1, (o, e))
+# rotate: прежний токен умирает, новый работает
+c, o, e = cli("sub", "rotate", "default", "--json")
+r = json.loads(o) if c == 0 else {}
+expect("sub rotate: новый url", c == 0 and r.get("url") and r["url"] != url1, (o, e))
+expect("sub rotate: прежний 404", ex.sub_response(ex.sub_meta(), "/s/" + tok)[0] == 404)
+tok2 = r["url"].rsplit("/s/", 1)[1]
+expect("sub rotate: новый работает", ex.sub_response(ex.sub_meta(), "/s/" + tok2)[0] == 200)
+# revoke
+expect("sub revoke", cli("sub", "revoke", "default")[0] == 0)
+expect("sub revoke: 404", ex.sub_response(ex.sub_meta(), "/s/" + tok2)[0] == 404)
+expect("sub revoke: повтор — ошибка", cli("sub", "revoke", "default")[0] == 1)
+# disable → токены сохраняются → enable → ссылки прежние
+url3 = json.loads(cli("sub", "token", "default", "--json")[1])["url"]
+expect("sub disable", cli("sub", "disable", "--json")[0] == 0)
+expect("sub disable: unit убран, правило ufw снято", not os.path.exists(ex.SUB_UNIT)
+       and "ufw=8443/tcp" not in open(ex.STATE).read(), open(ex.STATE).read())
+expect("sub status: выключена после disable", json.loads(cli("sub", "status", "--json")[1])["enabled"] is False)
+c, o, e = cli("sub", "export", "default", "--sub", "--json")
+expect("sub export --sub при выключенной: без подписки", c == 0
+       and json.loads(o)["endpoints"][0].get("subscription") is None, (o, e))
+expect("sub disable повторно — ошибка", cli("sub", "disable")[0] == 1)
+expect("sub enable снова", cli("sub", "enable", "--json")[0] == 0)
+expect("sub: токен пережил disable/enable", json.loads(cli("sub", "token", "default", "--json")[1])["url"] == url3)
+mode["api"] = False
+mode["x25519"] = ""
+
 c, o, e = cli("status", "--json")
 s = json.loads(o)
 expect("status: настроен, simple", c == 0 and s["installed"] and s["mode"] == "simple" and s["sni"] == "site.example" and s["users"] == 1 and s["exits"] == 0, o)
@@ -603,6 +721,7 @@ c, o, e = cli("direct", "country", "by", "--json")
 expect("country by: категории нет — только зона", c == 0 and json.loads(o)["domains"] == ["domain:by"], (o, e))
 c, o, e = cli("direct", "country", "ru", "--json")
 expect("country ru: прежний набор", c == 0 and json.loads(o)["domains"] == list(ex.RU_DOMAINS), o)
+expect("country: записана в файл состояния", "country=ru" in open(ex.STATE).read())
 expect("country: неверный код", cli("direct", "country", "rus")[0] == 1)
 for d in list(ex.RU_DOMAINS):
     cli("direct", "builtin", "remove", d)
