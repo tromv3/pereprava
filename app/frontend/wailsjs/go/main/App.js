@@ -198,6 +198,26 @@ export function Status(arg1) {
   return window['go']['main']['App']['Status'](arg1);
 }
 
+export function SubDisable(arg1) {
+  return window['go']['main']['App']['SubDisable'](arg1);
+}
+
+export function SubEnable(arg1, arg2) {
+  return window['go']['main']['App']['SubEnable'](arg1, arg2);
+}
+
+export function SubRevokeToken(arg1, arg2) {
+  return window['go']['main']['App']['SubRevokeToken'](arg1, arg2);
+}
+
+export function SubRotateToken(arg1, arg2) {
+  return window['go']['main']['App']['SubRotateToken'](arg1, arg2);
+}
+
+export function SubStatus(arg1) {
+  return window['go']['main']['App']['SubStatus'](arg1);
+}
+
 export function TrustServer(arg1, arg2) {
   return window['go']['main']['App']['TrustServer'](arg1, arg2);
 }

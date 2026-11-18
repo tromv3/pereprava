@@ -31,7 +31,15 @@
   exitctl user disable|enable <имя> [--json]       отключить или включить (ссылка не меняется)
   exitctl user reset <имя> [--json]                обнулить накопленный трафик пользователя
   exitctl user enforce [--json]                    учесть трафик и отключить вышедших за пределы (cron)
-  exitctl sub export <имя> [--host АДРЕС] [--json] профиль пользователя для мобильного приложения
+  exitctl sub export <имя> [--host АДРЕС] [--sub] [--json]
+                                                   профиль пользователя для мобильного приложения;
+                                                   --sub вложит ссылку подписки, если раздача включена
+  exitctl sub enable [--port N] [--host АДРЕС] [--json]
+                                                   раздача профилей по HTTPS (порт по умолчанию 8443)
+  exitctl sub status [--json]                      состояние раздачи
+  exitctl sub disable [--json]                     выключить раздачу (токены сохраняются)
+  exitctl sub token|rotate|revoke <имя> [--json]   ссылка подписки пользователя, перевыпуск, отзыв
+  exitctl sub serve                                HTTP-раздача профилей (запускает systemd)
   exitctl status [--json]                          состояние сервера и Xray
   exitctl health [--json]                          проблемы сервера: Xray, выходы, сертификат SNI, исходящий трафик (код 1 — есть проблемы)
   exitctl exit open [--json]                       выход — ещё и для клиентов (на выходе; ссылка моста не меняется)
@@ -42,7 +50,8 @@
   exitctl migrate import <файл> [--keys] [--json]  добавить их сюда; --keys заменяет ключи Reality
 """
 import contextlib, ipaddress, json, os, re, shutil, socket, ssl, statistics, subprocess, sys, tempfile, time, uuid
-import hashlib
+import base64, hashlib, secrets
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit, parse_qs, unquote
 from urllib.request import urlopen
@@ -66,6 +75,13 @@ LIVE_SERVICES = ("HandlerService", "RoutingService")  # пользователи
 USERS_META = os.environ.get("XRAY_USERS_META",
                             os.path.join(os.path.dirname(CONF_DIR.rstrip("/\\")), "exitctl-users.json"))
 CRON_FILE = os.environ.get("EXITCTL_CRON", "/etc/cron.d/exitctl-users")
+# Раздача профилей (подписка): настройки и токены, сертификат, unit systemd.
+SUB_META = os.environ.get("XRAY_SUB_META",
+                          os.path.join(os.path.dirname(CONF_DIR.rstrip("/\\")), "exitctl-sub.json"))
+SUB_CERT = os.path.join(os.path.dirname(CONF_DIR.rstrip("/\\")), "sub-tls.crt")
+SUB_KEY = os.path.join(os.path.dirname(CONF_DIR.rstrip("/\\")), "sub-tls.key")
+SUB_UNIT = os.environ.get("EXITCTL_SUB_UNIT", "/etc/systemd/system/pereprava-sub.service")
+SUB_RATE = 60  # запросов в минуту с одного адреса
 GB = 1024 ** 3
 LIMIT_REASONS = {"expired": "истёк срок", "traffic": "исчерпан трафик", "manual": "отключён вручную"}
 SNI_PORT = 443
@@ -1718,29 +1734,311 @@ def profile_export(name, host):
     }
 
 
+# --- Раздача профилей (подписка): HTTPS на отдельном порту, токен на пользователя ---
+
+def sub_meta():
+    meta = load(SUB_META, {"tokens": {}})
+    meta.setdefault("tokens", {})
+    return meta
+
+
+def save_sub_meta(meta):
+    save(SUB_META, meta)
+    with contextlib.suppress(OSError):
+        os.chmod(SUB_META, 0o600)  # токены — секреты, как UUID и ключи Reality рядом
+
+
+def sub_enabled(meta):
+    return bool(meta.get("port") and meta.get("host") and os.path.exists(SUB_UNIT))
+
+
+def sub_url(meta, token):
+    return f'https://{meta["host"]}:{meta["port"]}/s/{token}'
+
+
+def sub_attach(profile, meta, token):
+    """Вложить ссылку подписки в endpoint профиля, если раздача включена."""
+    if sub_enabled(meta):
+        profile["endpoints"][0]["subscription"] = {"url": sub_url(meta, token),
+                                                   "certSha256": meta.get("cert_sha256")}
+    return profile
+
+
+def sub_token_get(meta, name, create=True):
+    """Токен пользователя; create — завести новый, если ещё не было."""
+    for tok, rec in meta["tokens"].items():
+        if rec.get("user") == name:
+            return tok
+    if not create:
+        return None
+    tok = secrets.token_urlsafe(32)
+    meta["tokens"][tok] = {"user": name, "created": int(time.time())}
+    save_sub_meta(meta)
+    return tok
+
+
+def sub_user_active(name):
+    """Пользователь есть и не отключён (для token/rotate: токен бессмысленен без него)."""
+    base = load(BASE)
+    return any(client_name(c) == name for c in inbound_in(base)["settings"]["clients"])
+
+
+def ensure_sub_cert():
+    """Self-signed сертификат раздачи; возвращает sha256-отпечаток (hex) для пиннинга в приложении."""
+    if not (os.path.exists(SUB_CERT) and os.path.exists(SUB_KEY)):
+        r = subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_param:p256",
+                            "-nodes", "-days", "3650", "-subj", "/CN=pereprava-sub",
+                            "-keyout", SUB_KEY, "-out", SUB_CERT], capture_output=True, text=True)
+        if r.returncode != 0:
+            die("не удалось создать сертификат: " + r.stderr.strip())
+        os.chmod(SUB_KEY, 0o600)
+    r = subprocess.run(["openssl", "x509", "-in", SUB_CERT, "-outform", "der"], capture_output=True)
+    if r.returncode != 0:
+        die("не удалось прочитать сертификат раздачи")
+    return hashlib.sha256(r.stdout).hexdigest()
+
+
+def sub_enable(port, host):
+    if os.path.exists(SUB_UNIT):
+        die("раздача уже включена: exitctl sub status")
+    if not os.path.exists(BASE):
+        die("сначала настройте сервер (мост, простой режим или открытый выход): пользователей ещё нет")
+    if state_get("port") and port == int(state_get("port")):
+        die(f"порт {port} занят подключениями клиентов: выберите другой")
+    if port == 10085:
+        die("порт 10085 нужен API Xray: выберите другой")
+    for l in listening():
+        if l.get("port") == port and l.get("proto") == "tcp":
+            die(f'порт {port} уже занят ({l.get("process") or "другая программа"}): выберите другой')
+    host = host or detect_server_ip()
+    if not host:
+        die("не удалось определить внешний адрес сервера: укажите --host")
+    fp = ensure_sub_cert()
+    # Служба запускает установленную копию: обновляем её, чтобы раздача была от этой версии.
+    with contextlib.suppress(OSError):
+        shutil.copy(os.path.abspath(__file__), INSTALLED_TOOL)
+        os.chmod(INSTALLED_TOOL, 0o755)
+    with open(SUB_UNIT, "w") as f:
+        f.write("[Unit]\nDescription=Pereprava: раздача профилей (подписка)\nAfter=network.target\n\n"
+                "[Service]\nExecStart=" + INSTALLED_TOOL + " sub serve\nRestart=on-failure\nRestartSec=2\n\n"
+                "[Install]\nWantedBy=multi-user.target\n")
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    subprocess.run(["systemctl", "enable", "--now", "pereprava-sub"], capture_output=True)
+    if run_text("systemctl", "is-active", "pereprava-sub") != "active":
+        with contextlib.suppress(OSError):
+            os.remove(SUB_UNIT)
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+        die("служба pereprava-sub не запустилась: journalctl -u pereprava-sub")
+    ufw_add([f"{port}/tcp"])
+    meta = sub_meta()
+    meta.update(port=port, host=host, cert_sha256=fp)
+    save_sub_meta(meta)
+    return {"enabled": True, "port": port, "host": host, "certSha256": fp,
+            "url": f"https://{host}:{port}/s/<токен>"}
+
+
+def sub_disable():
+    if not os.path.exists(SUB_UNIT):
+        die("раздача не включена")
+    subprocess.run(["systemctl", "disable", "--now", "pereprava-sub"], capture_output=True)
+    with contextlib.suppress(OSError):
+        os.remove(SUB_UNIT)
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    meta = sub_meta()
+    if meta.get("port"):
+        ufw_remove([f'{meta["port"]}/tcp'])
+    return {"disabled": True, "tokens_kept": len(meta["tokens"])}
+
+
+def sub_status():
+    meta = sub_meta()
+    rep = {"enabled": sub_enabled(meta)}
+    if rep["enabled"]:
+        rep.update(port=meta["port"], host=meta["host"], certSha256=meta.get("cert_sha256"),
+                   tokens=[{"user": r["user"], "created": r.get("created")}
+                           for r in meta["tokens"].values()])
+    return rep
+
+
+def sub_response(meta, path, if_none_match=None):
+    """(код, заголовки, тело) ответа раздачи; вынесено для тестов."""
+    u = urlsplit(path)
+    m = re.fullmatch(r"/s/([A-Za-z0-9_-]{20,})", u.path)
+    rec = meta["tokens"].get(m.group(1)) if m else None
+    if not rec:
+        return 404, {"Content-Type": "text/plain; charset=utf-8"}, b"not found\n"
+    tok, host = m.group(1), meta["host"]
+    if parse_qs(u.query).get("format", [""])[0] == "v2ray":
+        try:
+            links = [e["link"] for e in profile_export(rec["user"], host)["endpoints"]]
+        except SystemExit:
+            return 410, {"Content-Type": "text/plain; charset=utf-8"}, b"user unavailable\n"
+        body = base64.b64encode(("\n".join(links) + "\n").encode())
+        return 200, {"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"}, body
+    try:
+        profile = sub_attach(profile_export(rec["user"], host), meta, tok)
+    except SystemExit:
+        return 410, {"Content-Type": "application/json; charset=utf-8"}, b'{"error":"user unavailable"}\n'
+    body = (json.dumps(profile, ensure_ascii=False) + "\n").encode()
+    etag = '"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+    if if_none_match == etag:
+        return 304, {"ETag": etag}, b""
+    return 200, {"Content-Type": "application/json; charset=utf-8", "ETag": etag,
+                 "Cache-Control": "no-store"}, body
+
+
+def sub_serve():
+    meta = sub_meta()
+    if not sub_enabled(meta):
+        die("раздача не настроена: exitctl sub enable")
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass  # журнала запросов нет: те же принципы приватности, что и у Xray
+
+        def do_GET(self):
+            now = time.time()
+            ip = self.client_address[0]
+            hits = [t for t in self.server.hits.get(ip, []) if now - t < 60]
+            if len(hits) >= SUB_RATE:
+                self.send_response(429)
+                self.end_headers()
+                return
+            hits.append(now)
+            self.server.hits[ip] = hits
+            code, headers, body = sub_response(meta, self.path, self.headers.get("If-None-Match"))
+            self.send_response(code)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(SUB_CERT, SUB_KEY)
+    ThreadingHTTPServer.daemon_threads = True
+    srv = ThreadingHTTPServer(("0.0.0.0", meta["port"]), Handler)
+    srv.hits = {}
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    print(f'Раздача профилей: https://{meta["host"]}:{meta["port"]}/s/<токен>')
+    srv.serve_forever()
+
+
 def cmd_sub(a):
-    usage = "используйте: exitctl sub export <имя> [--host АДРЕС] [--json]"
+    usage = ("используйте: exitctl sub export <имя> [--host АДРЕС] [--sub] [--json]\n"
+             "       или: exitctl sub status|serve|disable [--json]\n"
+             "       или: exitctl sub enable [--port N] [--host АДРЕС] [--json]\n"
+             "       или: exitctl sub token|rotate|revoke <имя> [--json]")
     as_json = "--json" in a
     a = [x for x in a if x != "--json"]
-    host = None
-    if "--host" in a:
-        i = a.index("--host")
-        host = a[i + 1] if i + 1 < len(a) else None
-        a = a[:i] + a[i + 2:]
-        if host is None or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+    host, port, with_sub = None, None, False
+    out = []
+    i = 0
+    while i < len(a):
+        if a[i] == "--host" and i + 1 < len(a):
+            host = a[i + 1]
+            i += 2
+        elif a[i] == "--port" and i + 1 < len(a):
+            port = a[i + 1]
+            i += 2
+        elif a[i] == "--sub":
+            with_sub = True
+            i += 1
+        else:
+            out.append(a[i])
+            i += 1
+    a = out
+    if host is not None and not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        die(f"--host: неверный адрес {host}")
+    if port is not None and (not port.isdigit() or not 1 <= int(port) <= 65535):
+        die("порт — число от 1 до 65535")
+    if not a:
+        die(usage)
+
+    if a == ["serve"]:
+        sub_serve()
+        return
+    if a == ["status"]:
+        rep = sub_status()
+        if as_json:
+            print(json.dumps(rep, ensure_ascii=False, indent=2))
+        elif not rep["enabled"]:
+            print("Раздача профилей не включена: exitctl sub enable")
+        else:
+            print(f'Раздача профилей: https://{rep["host"]}:{rep["port"]}/s/<токен>, '
+                  f'отпечаток {rep["certSha256"][:12]}…, токенов: {len(rep["tokens"])}')
+        return
+    if a[0] == "enable" and len(a) == 1:
+        rep = sub_enable(int(port) if port else 8443, host)
+        if as_json:
+            print(json.dumps(rep, ensure_ascii=False, indent=2))
+        else:
+            print(f'Раздача включена: {rep["url"]}')
+            print(f'Отпечаток сертификата (sha256) для пиннинга в приложении: {rep["certSha256"]}')
+            print("Ссылки пользователям: exitctl sub token <имя>; порт открыт в ufw как наш.")
+        return
+    if a == ["disable"]:
+        rep = sub_disable()
+        if as_json:
+            print(json.dumps(rep, ensure_ascii=False, indent=2))
+        else:
+            print(f'Раздача выключена. Токены сохранены ({rep["tokens_kept"]}): '
+                  "при следующем enable ссылки заработают снова.")
+        return
+    if a and a[0] in ("token", "rotate", "revoke"):
+        if len(a) != 2:
             die(usage)
+        name = clean_name(a[1])
+        if not name:
+            die("в имени нужны латинские буквы, цифры, - или _")
+        meta = sub_meta()
+        if not sub_enabled(meta):
+            die("раздача не включена: exitctl sub enable")
+        old = sub_token_get(meta, name, create=False)
+        if a[0] == "revoke":
+            if not old:
+                die(f'у «{name}» нет токена')
+            del meta["tokens"][old]
+            save_sub_meta(meta)
+            rep = {"revoked": True, "user": name}
+        else:
+            if not sub_user_active(name):
+                die(f'нет активного пользователя «{name}»')
+            if a[0] == "rotate" and old:
+                del meta["tokens"][old]
+            elif a[0] == "rotate" and not old:
+                die(f'у «{name}» нет токена: сначала exitctl sub token {name}')
+            tok = sub_token_get(meta, name)
+            rep = {"user": name, "url": sub_url(meta, tok),
+                   "created": meta["tokens"][tok]["created"]}
+        if as_json:
+            print(json.dumps(rep, ensure_ascii=False, indent=2))
+        elif a[0] == "revoke":
+            print(f'Ссылка подписки «{name}» отозвана.')
+        else:
+            print(rep["url"])
+            if a[0] == "rotate":
+                print("Прежняя ссылка перестала работать.")
+        return
     if len(a) != 2 or a[0] != "export":
         die(usage)
     name = clean_name(a[1])
     if not name:
         die("в имени нужны латинские буквы, цифры, - или _")
     profile = profile_export(name, host)
+    if with_sub:
+        meta = sub_meta()
+        if sub_enabled(meta):
+            sub_attach(profile, meta, sub_token_get(meta, name))
     if as_json:
         print(json.dumps(profile, ensure_ascii=False, indent=2))
     else:
         ep = profile["endpoints"][0]
         print(f'Профиль «{name}»: {ep["kind"]}' + (f', страна {ep["country"]}' if ep["country"] else ""))
         print(ep["link"])
+        if ep.get("subscription"):
+            print("Подписка: " + ep["subscription"]["url"])
 
 
 def read_file(path):
@@ -2509,11 +2807,12 @@ def cmd_migrate(a):
 
 
 # Команды, которые меняют конфиг или файл ограничений: выполняются по одной (cron и приложение).
-LOCKED = {"add", "remove", "use", "auto", "direct", "user", "migrate", "exit"}
+LOCKED = {"add", "remove", "use", "auto", "direct", "user", "migrate", "exit", "sub"}
 
 
 def main(a):
-    if a and (a[0] in LOCKED or a[:2] == ["sni", "set"]):
+    # sub serve работает постоянно: под замок его брать нельзя, остальные sub меняют состояние.
+    if a and (a[0] in LOCKED or a[:2] == ["sni", "set"]) and a[:2] != ["sub", "serve"]:
         with state_lock():
             return dispatch(a)
     return dispatch(a)

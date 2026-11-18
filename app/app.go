@@ -1387,7 +1387,7 @@ func (a *App) UserProfile(id, name string, also []string) (any, error) {
 	if !reUser.MatchString(name) {
 		return nil, errors.New("в имени допустимы латинские буквы, цифры, пробел, - и _")
 	}
-	primary, err := a.userTool(id, "sub", "export", name, "--json")
+	primary, err := a.userTool(id, "sub", "export", name, "--json", "--sub")
 	if err != nil {
 		return nil, err
 	}
@@ -1405,7 +1405,7 @@ func (a *App) UserProfile(id, name string, also []string) (any, error) {
 		if err != nil {
 			continue
 		}
-		p, err := a.userTool(otherID, "sub", "export", name, "--json")
+		p, err := a.userTool(otherID, "sub", "export", name, "--json", "--sub")
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", srv.Name, err))
 			continue
@@ -1497,6 +1497,56 @@ func (a *App) ChooseProfileSave(userName string) (string, error) {
 		DefaultFilename: fmt.Sprintf("pereprava-%s.pereprava-profile", name),
 		Filters:         []runtime.FileFilter{{DisplayName: "Профиль «Переправы» (*.pereprava-profile)", Pattern: "*.pereprava-profile"}},
 	})
+}
+
+// SubStatus — состояние раздачи профилей на сервере.
+func (a *App) SubStatus(id string) (any, error) {
+	return a.tool(id, false, "sub", "status", "--json")
+}
+
+// SubEnable включает раздачу профилей по HTTPS на порту port (0 — 8443).
+func (a *App) SubEnable(id string, port int) (any, error) {
+	if port == 0 {
+		port = 8443
+	}
+	srv, err := a.store.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkPort(port, srv.Port); err != nil {
+		return nil, err
+	}
+	if st, err := a.Status(id); err == nil {
+		if m, _ := st.(map[string]any); m != nil {
+			if cp, ok := m["port"].(float64); ok && int(cp) == port {
+				return nil, fmt.Errorf("порт %d занят подключениями клиентов: выберите другой", port)
+			}
+		}
+	}
+	return a.tool(id, false, "sub", "enable", "--port", strconv.Itoa(port), "--json")
+}
+
+// SubDisable выключает раздачу; токены сохраняются до следующего включения.
+func (a *App) SubDisable(id string) error {
+	return a.plainTool(id, "sub", "disable")
+}
+
+// SubRotateToken перевыпускает ссылку подписки пользователя: прежняя перестаёт работать.
+func (a *App) SubRotateToken(id, name string) (any, error) {
+	name = strings.TrimSpace(name)
+	if !reUser.MatchString(name) {
+		return nil, errors.New("в имени допустимы латинские буквы, цифры, пробел, - и _")
+	}
+	return a.tool(id, false, "sub", "rotate", name, "--json")
+}
+
+// SubRevokeToken отзывает ссылку подписки пользователя.
+func (a *App) SubRevokeToken(id, name string) error {
+	name = strings.TrimSpace(name)
+	if !reUser.MatchString(name) {
+		return errors.New("в имени допустимы латинские буквы, цифры, пробел, - и _")
+	}
+	return a.plainTool(id, "sub", "revoke", name)
 }
 
 // QRCode рисует ссылку как PNG в data-URL. Работает локально, ссылка никуда не отправляется.

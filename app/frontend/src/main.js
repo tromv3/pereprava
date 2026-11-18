@@ -7,6 +7,7 @@ import {
   ClientConnect, ClientDisconnect, ClientEnableTUN, ClientState,
   ChooseGeoFiles, ChooseXrayFile, ImportXray, UpdateGeodataFromFiles, UpdateXrayFromFile,
   ChooseProfileSave, SaveProfileFile, UserProfile,
+  SubStatus, SubEnable, SubDisable, SubRotateToken,
 } from '../wailsjs/go/main/App';
 import { ClipboardSetText, EventsOn, WindowSetTitle } from '../wailsjs/runtime/runtime';
 
@@ -499,8 +500,8 @@ function egressWarning(st) {
 function renderServerBody(body, server, st) {
   const panels = !st.installed ? [installPanel(server, st)]
     : st.mode === 'exit' ? [exitInfoPanel(server, st)]
-      : st.mode === 'bridge' ? [exitsPanel(server), usersPanel(server, st), directPanel(server), migratePanel(server, st)]
-        : [st.bridge_user && exitInfoPanel(server, st), usersPanel(server, st), migratePanel(server, st)].filter(Boolean);
+      : st.mode === 'bridge' ? [exitsPanel(server), usersPanel(server, st), subPanel(server), directPanel(server), migratePanel(server, st)]
+        : [st.bridge_user && exitInfoPanel(server, st), usersPanel(server, st), subPanel(server), migratePanel(server, st)].filter(Boolean);
   if (st.installed) panels.push(maintenancePanel(server, st));
   body.replaceChildren(...[healthNotice(server.id), egressWarning(st), statusPanel(st), ...panels].filter(Boolean));
   // Открытый сервер проверяем заново, если результат старше 5 минут.
@@ -1313,6 +1314,68 @@ async function showLink(user) {
   ]);
 }
 
+// --- Раздача профилей (подписка): HTTPS на отдельном порту, токен на пользователя ---
+function subPanel(server) {
+  const box = h('div', {}, h('p', { class: 'hint' }, 'Загружаю состояние раздачи...'));
+  const errorBox = h('div');
+  const showError = (e) => errorBox.replaceChildren(h('div', { class: 'error' }, msg(e)));
+
+  function render(rep) {
+    const rows = [];
+    if (!rep.enabled) {
+      const port = h('input', { type: 'number', min: '1', max: '65535', value: '8443', style: 'width:90px' });
+      const enableBtn = h('button', { class: 'primary' }, 'Включить');
+      enableBtn.addEventListener('click', async () => {
+        errorBox.replaceChildren();
+        const ok = await confirmDialog('Включить раздачу профилей?',
+          `На сервере откроется отдельный HTTPS-порт ${port.value || 8443}: по ссылке с личным токеном каждый пользователь получает свой актуальный профиль. Порт Reality и маскировка не затрагиваются. Сертификат self-signed: приложение запоминает его отпечаток при импорте профиля.`,
+          'Включить');
+        if (!ok) return;
+        enableBtn.disabled = true;
+        try {
+          await SubEnable(server.id, Number(port.value) || 0);
+          await load();
+        } catch (e) {
+          showError(e);
+        } finally {
+          enableBtn.disabled = false;
+        }
+      });
+      rows.push(h('p', { class: 'hint' }, 'Раздача выключена. Когда включена, приложение пользователя само получает актуальный профиль (смена SNI, новые точки), а тот же адрес работает как подписка в v2rayNG, Happ и Hiddify (параметр ?format=v2ray).'),
+        h('div', { class: 'row' }, h('span', {}, 'Порт:'), port, enableBtn));
+    } else {
+      const disableBtn = h('button', { class: 'danger' }, 'Выключить');
+      disableBtn.addEventListener('click', async () => {
+        const ok = await confirmDialog('Выключить раздачу профилей?',
+          'Ссылки подписок перестанут отвечать, приложения перестанут получать обновления (последний профиль продолжит работать). Токены сохранятся: при повторном включении ссылки заработают снова.',
+          'Выключить');
+        if (!ok) return;
+        errorBox.replaceChildren();
+        try {
+          await SubDisable(server.id);
+          await load();
+        } catch (e) { showError(e); }
+      });
+      rows.push(h('p', {}, `Включена: https://${rep.host}:${rep.port}/s/<токен>`),
+        h('p', { class: 'hint' }, `Отпечаток сертификата (sha256): ${rep.certSha256 ? rep.certSha256.slice(0, 23) + '…' : '—'}. Токенов: ${(rep.tokens || []).length}. Ссылку пользователя даёт кнопка «Профиль» у пользователя выше.`),
+        h('div', { class: 'row' }, disableBtn));
+    }
+    box.replaceChildren(...rows);
+  }
+
+  async function load() {
+    try {
+      render(await SubStatus(server.id));
+    } catch (e) {
+      box.replaceChildren();
+      showError(e);
+    }
+  }
+
+  load();
+  return h('div', { class: 'panel' }, h('h3', {}, 'Раздача профилей'), errorBox, box);
+}
+
 const DISABLED_NAMES = { expired: 'истёк срок', traffic: 'исчерпан трафик', manual: 'отключён вручную' };
 
 // base64url без паддинга: так профиль упаковывается в deep-link pereprava://profile#... (docs/android-plan.md).
@@ -1357,15 +1420,33 @@ function profileDialog(server, u) {
             saveBtn.textContent = 'Сохранено';
           } catch (e) { err.textContent = msg(e); }
         });
+        const withSub = profile.endpoints.some((e) => e.subscription);
+        const rotateBtn = withSub && h('button', {}, 'Перевыпустить ссылку подписки');
+        if (rotateBtn) {
+          rotateBtn.addEventListener('click', async () => {
+            const ok = await confirmDialog('Перевыпустить ссылку подписки?',
+              `Прежняя ссылка «${u.name}» перестанет отвечать: устройство с ней перестанет получать обновления профиля (последний профиль продолжит работать). Новую ссылку нужно передать пользователю заново.`,
+              'Перевыпустить');
+            if (!ok) return;
+            try {
+              await SubRotateToken(server.id, u.name);
+              buildBtn.click(); // собрать профиль заново: QR и ссылка уже с новым токеном
+            } catch (e) { err.textContent = msg(e); }
+          });
+        }
         result.replaceChildren(
           ...(problems && problems.length ? [h('div', { class: 'error' }, 'Не удалось добавить: ' + problems.join('; '))] : []),
           qr ? h('img', { class: 'qr', src: qr, alt: 'QR профиля' })
              : h('p', { class: 'hint' }, 'Ссылка не поместилась в QR — передайте файлом или кнопкой «Копировать».'),
           h('ul', {}, profile.endpoints.map((e) => h('li', {},
-            `${ENDPOINT_KINDS[e.kind] || e.kind}${e.country ? `, страна ${e.country}` : ''}${e.default ? ' — по умолчанию' : ''}`))),
+            `${ENDPOINT_KINDS[e.kind] || e.kind}${e.country ? `, страна ${e.country}` : ''}${e.default ? ' — по умолчанию' : ''}${e.subscription ? ' (↻ автообновление)' : ''}`))),
+          h('p', { class: 'hint' }, withSub
+            ? 'Раздача профилей включена: приложение будет обновлять профиль само.'
+            : 'Раздача профилей на сервере выключена: при смене SNI или адреса профиль нужно будет выдать заново. Включается на странице сервера, «Раздача профилей».'),
           h('div', { class: 'modal-actions' },
             h('button', { onclick: (e) => { ClipboardSetText(deep); e.target.textContent = 'Скопировано'; } }, 'Копировать ссылку'),
-            saveBtn));
+            saveBtn,
+            rotateBtn));
       } catch (e) {
         err.textContent = msg(e);
       } finally {

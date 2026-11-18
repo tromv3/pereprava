@@ -101,6 +101,16 @@ export function SetUserLimit(arg1:string,arg2:string,arg3:string,arg4:number):Pr
 
 export function Status(arg1:string):Promise<any>;
 
+export function SubDisable(arg1:string):Promise<void>;
+
+export function SubEnable(arg1:string,arg2:number):Promise<any>;
+
+export function SubRevokeToken(arg1:string,arg2:string):Promise<void>;
+
+export function SubRotateToken(arg1:string,arg2:string):Promise<any>;
+
+export function SubStatus(arg1:string):Promise<any>;
+
 export function TrustServer(arg1:string,arg2:string):Promise<void>;
 
 export function Uninstall(arg1:string):Promise<void>;
